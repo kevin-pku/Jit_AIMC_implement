@@ -330,6 +330,8 @@ def main(args):
 
     torch._dynamo.config.cache_size_limit = 128
     torch._dynamo.config.optimize_ddp = False
+    # Fall back to eager if a backend compiler (e.g., inductor) fails, instead of crashing
+    torch._dynamo.config.suppress_errors = True
 
     model, model_without_ddp, optimizer = create_model_and_optimizer(args, device)
     resume_or_initialize(args, model_without_ddp, optimizer)
