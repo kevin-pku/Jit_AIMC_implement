@@ -5,6 +5,7 @@ import shutil
 import torch
 import numpy as np
 import cv2
+import copy
 
 import util.misc as misc
 import util.lr_sched as lr_sched
@@ -37,7 +38,60 @@ def _compute_fid_with_stats(save_folder, fid_stats_path, batch_size):
     }
     metric = fid_statistics_to_metric(stats_fake, stats_real, verbose=False)
     return metric[KEY_METRIC_FID]
-import copy
+
+
+def _prepare_generation_labels(args):
+    """Create the per-rank label schedule for generation with readability in mind."""
+    class_num = args.class_num
+    if args.num_images < class_num or args.num_images % class_num != 0:
+        if getattr(args, 'label_strategy', 'repeat') == 'spread':
+            class_label_gen_world = np.linspace(0, class_num - 1, num=args.num_images, dtype=int)
+            print("[INFO] Using spread label strategy for diversity.")
+        else:
+            print(
+                "[WARN] num_images {} not divisible by class_num {}; repeating labels as needed.".format(
+                    args.num_images, class_num
+                )
+            )
+            repeat = int(np.ceil(args.num_images / class_num))
+            class_label_gen_world = np.tile(np.arange(0, class_num), repeat)[:args.num_images]
+    else:
+        class_label_gen_world = np.arange(0, class_num).repeat(args.num_images // class_num)
+    return np.hstack([class_label_gen_world, np.zeros(50000)])
+
+
+def _maybe_swap_ema_for_eval(model_without_ddp, args):
+    use_ema = not getattr(args, 'disable_eval_ema', False) and getattr(args, 'eval_ema_index', 1) != 0
+    ema_choice = getattr(args, 'eval_ema_index', 1)
+    if not use_ema:
+        print("Skip EMA swap for evaluation")
+        return None, use_ema
+
+    model_state_dict = copy.deepcopy(model_without_ddp.state_dict())
+    ema_state_dict = copy.deepcopy(model_without_ddp.state_dict())
+    ema_source = model_without_ddp.ema_params1 if ema_choice == 1 else model_without_ddp.ema_params2
+    for i, (name, _value) in enumerate(model_without_ddp.named_parameters()):
+        assert name in ema_state_dict
+        ema_state_dict[name] = ema_source[i]
+    print(f"Switch to ema{ema_choice}")
+    model_without_ddp.load_state_dict(ema_state_dict)
+    return model_state_dict, use_ema
+
+
+def _log_tensor_stats(prefix, tensor):
+    print(
+        f"DEBUG [{prefix}] min/max/mean/std:",
+        tensor.min().item(),
+        tensor.max().item(),
+        tensor.mean().item(),
+        tensor.std().item()
+    )
+
+
+def _denormalize_images(sampled_images):
+    sampled_images = (sampled_images + 1) / 2
+    _log_tensor_stats("After Denorm", sampled_images)
+    return sampled_images.detach().cpu()
 
 
 def train_one_epoch(model, model_without_ddp, data_loader, optimizer, device, epoch, log_writer=None, args=None):
@@ -115,40 +169,8 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
     if misc.get_rank() == 0 and not os.path.exists(save_folder):
         os.makedirs(save_folder)
 
-    use_ema = not getattr(args, 'disable_eval_ema', False) and getattr(args, 'eval_ema_index', 1) != 0
-    ema_choice = getattr(args, 'eval_ema_index', 1)
-    if use_ema:
-        # switch to selected ema params
-        model_state_dict = copy.deepcopy(model_without_ddp.state_dict())
-        ema_state_dict = copy.deepcopy(model_without_ddp.state_dict())
-        ema_source = model_without_ddp.ema_params1 if ema_choice == 1 else model_without_ddp.ema_params2
-        for i, (name, _value) in enumerate(model_without_ddp.named_parameters()):
-            assert name in ema_state_dict
-            ema_state_dict[name] = ema_source[i]
-        print(f"Switch to ema{ema_choice}")
-        model_without_ddp.load_state_dict(ema_state_dict)
-    else:
-        model_state_dict = None
-        print("Skip EMA swap for evaluation")
-
-    # ensure that the number of images per class is equal, or optionally spread labels for small samples.
-    class_num = args.class_num
-    if args.num_images < class_num or args.num_images % class_num != 0:
-        if getattr(args, 'label_strategy', 'repeat') == 'spread':
-            # Spread labels across the full class range for diversity
-            class_label_gen_world = np.linspace(0, class_num - 1, num=args.num_images, dtype=int)
-            print("[INFO] Using spread label strategy for diversity.")
-        else:
-            print(
-                "[WARN] num_images {} not divisible by class_num {}; repeating labels as needed.".format(
-                    args.num_images, class_num
-                )
-            )
-            repeat = int(np.ceil(args.num_images / class_num))
-            class_label_gen_world = np.tile(np.arange(0, class_num), repeat)[:args.num_images]
-    else:
-        class_label_gen_world = np.arange(0, class_num).repeat(args.num_images // class_num)
-    class_label_gen_world = np.hstack([class_label_gen_world, np.zeros(50000)])
+    model_state_dict, use_ema = _maybe_swap_ema_for_eval(model_without_ddp, args)
+    class_label_gen_world = _prepare_generation_labels(args)
 
     for i in range(num_steps):
         print("Generation step {}/{}".format(i, num_steps))
@@ -164,27 +186,8 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
         if misc.is_dist_avail_and_initialized():
             torch.distributed.barrier()
 
-        # Debug prints requested by user
-        print(
-            "DEBUG [Before Denorm] min/max/mean/std:",
-            sampled_images.min().item(),
-            sampled_images.max().item(),
-            sampled_images.mean().item(),
-            sampled_images.std().item()
-        )
-
-        # denormalize images
-        sampled_images = (sampled_images + 1) / 2
-        
-        print(
-            "DEBUG [After Denorm] min/max/mean/std:",
-            sampled_images.min().item(),
-            sampled_images.max().item(),
-            sampled_images.mean().item(),
-            sampled_images.std().item()
-        )
-
-        sampled_images = sampled_images.detach().cpu()
+        _log_tensor_stats("Before Denorm", sampled_images)
+        sampled_images = _denormalize_images(sampled_images)
 
         # distributed save images
         for b_id in range(sampled_images.size(0)):
