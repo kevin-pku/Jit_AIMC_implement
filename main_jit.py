@@ -114,6 +114,8 @@ def get_args_parser():
                         help='Path to pre-quantized FFN INT7 weights state_dict; optional')
     parser.add_argument('--ffn_weight_clip_pct', default=0.0, type=float,
                         help='Optional percentile clipping (e.g., 99.9) on FFN weights before quantization in bit-serial mode')
+    parser.add_argument('--ffn_weight_nbit', default=8, type=int,
+                        help='Bitwidth for FFN bit-serial weight quantization (e.g., 8 for INT8, 7 for INT7)')
     parser.add_argument('--keep_generated', action='store_true',
                         help='Do not delete generated samples after FID/IS (for exporting)')
     parser.add_argument('--fid_stats_path', default='', type=str,
@@ -150,34 +152,16 @@ def get_args_parser():
     return parser
 
 
-def main(args):
-    misc.init_distributed_mode(args)
-    print('Job directory:', os.path.dirname(os.path.realpath(__file__)))
-    print("Arguments:\n{}".format(args).replace(', ', ',\n'))
-
-    device = torch.device(args.device)
-    if not hasattr(args, 'gpu') or args.gpu is None:
-        # When not launched via torch.distributed, default to GPU 0
-        args.gpu = device.index if device.index is not None else 0
-
-    # Set seeds for reproducibility
-    seed = args.seed + misc.get_rank()
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-
-    cudnn.benchmark = True
-
-    num_tasks = misc.get_world_size()
-    global_rank = misc.get_rank()
-
-    # Set up TensorBoard logging (only on main process)
+def setup_logging(args, global_rank):
+    """Create a tensorboard writer on the main process only."""
     if global_rank == 0 and args.output_dir is not None:
         os.makedirs(args.output_dir, exist_ok=True)
-        log_writer = SummaryWriter(log_dir=args.output_dir)
-    else:
-        log_writer = None
+        return SummaryWriter(log_dir=args.output_dir)
+    return None
 
-    # Data augmentation transforms
+
+def build_data_loader(args, seed, global_rank, num_tasks):
+    """Construct the training dataset, optional subset, and dataloader."""
     transform_train = transforms.Compose([
         transforms.Lambda(lambda img: center_crop_arr(img, args.img_size)),
         transforms.RandomHorizontalFlip(),
@@ -210,11 +194,11 @@ def main(args):
         pin_memory=args.pin_mem,
         drop_last=True
     )
+    return data_loader_train
 
-    torch._dynamo.config.cache_size_limit = 128
-    torch._dynamo.config.optimize_ddp = False
 
-    # Create denoiser
+def create_model_and_optimizer(args, device):
+    """Instantiate the denoiser model and its optimizer."""
     model = Denoiser(args)
 
     print("Model =", model)
@@ -237,12 +221,14 @@ def main(args):
     else:
         model_without_ddp = model
 
-    # Set up optimizer with weight decay adjustment for bias and norm layers
     param_groups = misc.add_weight_decay(model_without_ddp, args.weight_decay)
     optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
     print(optimizer)
+    return model, model_without_ddp, optimizer
 
-    # Resume from checkpoint if provided
+
+def resume_or_initialize(args, model_without_ddp, optimizer):
+    """Resume from checkpoint when available, otherwise initialize EMA buffers."""
     checkpoint_path = os.path.join(args.resume, "checkpoint-last.pth") if args.resume else None
     if checkpoint_path and os.path.exists(checkpoint_path):
         checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
@@ -259,21 +245,27 @@ def main(args):
             args.start_epoch = checkpoint['epoch'] + 1
             print("Loaded optimizer & scaler state!")
         del checkpoint
-    else:
-        model_without_ddp.ema_params1 = copy.deepcopy(list(model_without_ddp.parameters()))
-        model_without_ddp.ema_params2 = copy.deepcopy(list(model_without_ddp.parameters()))
-        print("Training from scratch")
-
-    # Evaluate generation
-    if args.evaluate_gen:
-        print("Evaluating checkpoint at {} epoch".format(args.start_epoch))
-        with torch.random.fork_rng():
-            torch.manual_seed(seed)
-            with torch.no_grad():
-                evaluate(model_without_ddp, args, 0, batch_size=args.gen_bsz, log_writer=log_writer)
         return
 
-    # Training loop
+    model_without_ddp.ema_params1 = copy.deepcopy(list(model_without_ddp.parameters()))
+    model_without_ddp.ema_params2 = copy.deepcopy(list(model_without_ddp.parameters()))
+    print("Training from scratch")
+
+
+def maybe_run_evaluation(model_without_ddp, args, seed, log_writer):
+    """Run standalone evaluation path when requested."""
+    if not args.evaluate_gen:
+        return False
+
+    print("Evaluating checkpoint at {} epoch".format(args.start_epoch))
+    with torch.random.fork_rng():
+        torch.manual_seed(seed)
+        with torch.no_grad():
+            evaluate(model_without_ddp, args, 0, batch_size=args.gen_bsz, log_writer=log_writer)
+    return True
+
+
+def train_epochs(model, model_without_ddp, data_loader_train, optimizer, device, log_writer, args, seed):
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
     for epoch in range(args.start_epoch, args.epochs):
@@ -289,7 +281,7 @@ def main(args):
                 model_without_ddp=model_without_ddp,
                 optimizer=optimizer,
                 epoch=epoch,
-                epoch_name="last"
+                epoch_name="last",
             )
 
         if epoch % 100 == 0 and epoch > 0:
@@ -297,7 +289,7 @@ def main(args):
                 args=args,
                 model_without_ddp=model_without_ddp,
                 optimizer=optimizer,
-                epoch=epoch
+                epoch=epoch,
             )
 
         # Perform online evaluation at specified intervals
@@ -313,6 +305,43 @@ def main(args):
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time:', total_time_str)
+
+
+def main(args):
+    misc.init_distributed_mode(args)
+    print('Job directory:', os.path.dirname(os.path.realpath(__file__)))
+    print("Arguments:\n{}".format(args).replace(', ', ',\n'))
+
+    device = torch.device(args.device)
+    if not hasattr(args, 'gpu') or args.gpu is None:
+        # When not launched via torch.distributed, default to GPU 0
+        args.gpu = device.index if device.index is not None else 0
+
+    # Set seeds for reproducibility
+    seed = args.seed + misc.get_rank()
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    cudnn.benchmark = True
+
+    num_tasks = misc.get_world_size()
+    global_rank = misc.get_rank()
+
+    log_writer = setup_logging(args, global_rank)
+    data_loader_train = build_data_loader(args, seed, global_rank, num_tasks)
+
+    torch._dynamo.config.cache_size_limit = 128
+    torch._dynamo.config.optimize_ddp = False
+    # Fall back to eager if a backend compiler (e.g., inductor) fails, instead of crashing
+    torch._dynamo.config.suppress_errors = True
+
+    model, model_without_ddp, optimizer = create_model_and_optimizer(args, device)
+    resume_or_initialize(args, model_without_ddp, optimizer)
+
+    if maybe_run_evaluation(model_without_ddp, args, seed, log_writer):
+        return
+
+    train_epochs(model, model_without_ddp, data_loader_train, optimizer, device, log_writer, args, seed)
 
 
 if __name__ == '__main__':
