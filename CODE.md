@@ -9,17 +9,17 @@
 - `model_jit.py`：实现 JiT 模型、AIMC 友好的位串行线性层、假量化与静态量化路径，以及所有 Transformer 组件（补丁嵌入、RMSNorm、RoPE 等）。【F:model_jit.py†L1-L520】
 
 ## 核心组件与量化/ADC 实现
-### BitSerialLinearW8A16（位串行线性层）
-- 目标：用 INT8 权重、虚拟 INT16 激活模拟 CIM/闪存阵列的位串行乘加，并带有 10~12bit ADC 饱和与可选 bypass。【F:model_jit.py†L81-L183】
+### BitSerialLinearW8A12（带重叠的位串行线性层）
+- 目标：用 INT8 权重、带 4bit 重叠的双 8bit slice 实现 **等效 W8A12**，以建模 2-Pass CIM 在噪声预算/ENOB 限制下的有效 12bit 精度，同时仍考虑 10~12bit ADC 饱和与可选 bypass。【F:model_jit.py†L81-L186】
 - 主要步骤：
   1. **动态权重量化**：按最大绝对值求 scale，映射到 [-128,127]；可选百分位裁剪以抑制异常值。【F:model_jit.py†L120-L129】
-  2. **激活 INT16 量化与位切分**：自动或外部提供激活 scale，将输入量化到 [-32768,32767]，再拆分 MSB（符号）与 LSB（无符号 0~255）分支，模拟高低位分阵列。【F:model_jit.py†L144-L158】
+  2. **激活 INT12 量化与重叠位切分**：默认将输入量化到 [-2048,2047]，采用 8bit slice + 4bit overlap（可通过 `--ffn_act_nbit/--ffn_overlap_bits` 调整）生成 MSB/LSB，模拟为抵抗底噪而牺牲的冗余位宽。【F:model_jit.py†L135-L158】
   3. **模拟阵列 MVM**：关闭 autocast 用 FP32 计算 MSB/LSB 线性输出，确保低位精度。【F:model_jit.py†L159-L163】
   4. **ADC 量化**：分别对 MSB/LSB 结果按自身峰值映射到 N-bit ADC（默认 10bit，支持环境变量 bypass），再反量化回模拟电平。【F:model_jit.py†L164-L176】
-  5. **重建与缩放**：按照 (MSB<<8 + LSB)>>8 的规则重组，再乘以激活/权重全局 scale；最后加上偏置。【F:model_jit.py†L177-L183】
+  5. **重建与缩放**：使用重叠切分对应的步长重组 MSB/LSB，再乘以激活/权重全局 scale；最后加上偏置。【F:model_jit.py†L177-L186】
 
 ### FFN 假量化与静态量化路径
-- `SwiGLUFFN` 在 `fake_quant=True` 时用两层 `BitSerialLinearW8A16` 模拟前馈；否则回退到普通 `nn.Linear`。【F:model_jit.py†L320-L335】
+- `SwiGLUFFN` 在 `fake_quant=True` 时用两层 `BitSerialLinearW8A16`（默认等效 W8A12，可配置有效位宽与重叠）模拟前馈；否则回退到普通 `nn.Linear`。【F:model_jit.py†L320-L402】
 - 支持三种模式：
   - **动态位串行**：默认动态权重量化与激活动态 scale，配合 ADC 饱和；可通过 `BIT_SERIAL_SINGLE_PASS` 走不切片的调试路径。【F:model_jit.py†L117-L143】【F:model_jit.py†L144-L183】
   - **假量化 (fake quant)**：在 CPU/GPU 上用 `_fake_quant` 将权重(7bit)/激活(8bit)裁剪并量化，输出再经过 10bit `_fake_adc_10bit` 模拟 ADC 饱和。【F:model_jit.py†L336-L402】
@@ -44,4 +44,4 @@
 
 ## 量化/硬件相关小贴士
 - 环境变量 `BIT_SERIAL_ADC_BYPASS` 可跳过 ADC 量化，`BIT_SERIAL_SINGLE_PASS` 可禁用位切分；`JIT_DISABLE_TORCH_COMPILE` 可关闭 `torch.compile` 以方便调试。【F:model_jit.py†L18-L25】【F:model_jit.py†L117-L119】【F:model_jit.py†L164-L176】
-- `main_jit.py` 暴露 `--ffn_fake_quant/--ffn_use_kl_scales/--ffn_int7_weights/--ffn_weight_clip_pct`，可在推理时灵活切换动态/静态量化与权重裁剪策略，便于对接不同硬件约束。【F:main_jit.py†L109-L149】
+- `main_jit.py` 暴露 `--ffn_fake_quant/--ffn_use_kl_scales/--ffn_int7_weights/--ffn_weight_clip_pct/--ffn_act_nbit/--ffn_overlap_bits`，可在推理时灵活切换动态/静态量化、有效位宽与权重裁剪策略，便于对接不同硬件约束。【F:main_jit.py†L109-L151】

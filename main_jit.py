@@ -116,6 +116,10 @@ def get_args_parser():
                         help='Optional percentile clipping (e.g., 99.9) on FFN weights before quantization in bit-serial mode')
     parser.add_argument('--ffn_weight_nbit', default=8, type=int,
                         help='Bitwidth for FFN bit-serial weight quantization (e.g., 8 for INT8, 7 for INT7)')
+    parser.add_argument('--ffn_act_nbit', default=12, type=int,
+                        help='Effective activation bitwidth for bit-serial CIM simulation (e.g., 12 for W8A12 with noise budget)')
+    parser.add_argument('--ffn_overlap_bits', default=None, type=int,
+                        help='Optional overlap bits between the two 8-bit slices; default auto-computes overlap to reach the desired effective activation bitwidth')
     parser.add_argument('--keep_generated', action='store_true',
                         help='Do not delete generated samples after FID/IS (for exporting)')
     parser.add_argument('--fid_stats_path', default='', type=str,

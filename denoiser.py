@@ -20,6 +20,8 @@ class Denoiser(nn.Module):
             ffn_int7_weights_path=getattr(args, 'ffn_int7_weights', ''),
             ffn_weight_clip_pct=getattr(args, 'ffn_weight_clip_pct', 0.0),
             ffn_weight_nbit=getattr(args, 'ffn_weight_nbit', 8),
+            ffn_act_nbit_eff=getattr(args, 'ffn_act_nbit', 12),
+            ffn_overlap_bits=getattr(args, 'ffn_overlap_bits', None),
         )
         self.img_size = args.img_size
         self.num_classes = args.class_num

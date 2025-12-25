@@ -82,19 +82,34 @@ class BitSerialLinearW8A16(nn.Module):
     """
     Bit-serial input CIM-style Linear with INTn weights (default INT8) and virtual INT16 activations.
     Slicing/Reconstruction are forced to float32 to preserve LSB contribution under BF16 autocast.
+
+    NOTE: The historical class name is kept for compatibility, but the default effective activation
+    precision now targets W8A12 to model noise budget/overlap redundancy in 2-pass silicon.
     """
 
-    def __init__(self, in_features: int, out_features: int, bias: bool = True, adc_nbit: int = 10, weight_clip_pct: float = 0.0, weight_nbit: int = 8):
+    def __init__(self, in_features: int, out_features: int, bias: bool = True, adc_nbit: int = 10, weight_clip_pct: float = 0.0, weight_nbit: int = 8,
+                 act_nbit_eff: int = 12, overlap_bits: int | None = None, slice_nbit: int = 8):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.adc_nbit = adc_nbit
         self.weight_clip_pct = weight_clip_pct
         self.weight_nbit = weight_nbit
+        self.slice_nbit = slice_nbit
+        # Overlap defaults to the gap between the two 8-bit slices and the target effective precision
+        default_overlap = max(0, slice_nbit * 2 - act_nbit_eff)
+        self.overlap_bits = overlap_bits if overlap_bits is not None else default_overlap
+        self.slice_shift = self.slice_nbit - self.overlap_bits
+        if self.slice_shift <= 0:
+            raise ValueError(f"Invalid overlap_bits={self.overlap_bits}; slice_shift must be positive")
         self.qmax_adc = (1 << (adc_nbit - 1)) - 1
         self.qmin_adc = - (1 << (adc_nbit - 1))
         self.qmax_w = (1 << (weight_nbit - 1)) - 1
         self.qmin_w = - (1 << (weight_nbit - 1))
+        self.qmax_act = (1 << (act_nbit_eff - 1)) - 1
+        self.qmin_act = - (1 << (act_nbit_eff - 1))
+        self.qmax_slice = (1 << (slice_nbit - 1)) - 1
+        self.qmin_slice = - (1 << (slice_nbit - 1))
 
         # Master FP32 weights
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
@@ -144,20 +159,21 @@ class BitSerialLinearW8A16(nn.Module):
                 y = y + self.bias.float()
             return y
 
-        # 2) Activation scale: trust provided scale; default to INT16 dynamic range when absent
+        # 2) Activation scale: trust provided scale; default to target effective dynamic range when absent
         if act_scale is None:
             max_abs_act = torch.max(x.abs())
-            act_scale = torch.clamp(max_abs_act / 32767.0, min=1e-8)
+            act_scale = torch.clamp(max_abs_act / float(self.qmax_act), min=1e-8)
         else:
             act_scale = act_scale.to(dtype=torch.float32)
         act_scale = act_scale.to(dtype=torch.float32, device=x.device)
 
-        # 3) Quantize activations to INT16 in float32 domain
-        x_int = torch.clamp(torch.round(x / act_scale), -32768, 32767)
+        # 3) Quantize activations to INT{act_nbit_eff} in float32 domain
+        x_int = torch.clamp(torch.round(x / act_scale), self.qmin_act, self.qmax_act)
 
-        # 4) Bit-slice per spec: arithmetic shift for MSB, mask-style LSB (0..255) with no pre-scaling
-        x_msb = torch.div(x_int, 256.0, rounding_mode='floor').clamp(-128, 127)
-        x_lsb = (x_int - x_msb * 256.0).clamp(0, 255)
+        # 4) Bit-slice with overlap (e.g., 2-pass 8-bit slices with 4-bit overlap -> effective 12-bit)
+        slice_base = float(2 ** self.slice_shift)
+        x_msb = torch.div(x_int, slice_base, rounding_mode='floor').clamp(self.qmin_slice, self.qmax_slice)
+        x_lsb = (x_int - x_msb * slice_base).clamp(0, slice_base - 1)
 
         # 5) MVM in float32 (disable autocast)
         with torch.cuda.amp.autocast(enabled=False):
@@ -177,9 +193,10 @@ class BitSerialLinearW8A16(nn.Module):
             y_msb_adc = y_msb_adc * s_adc_msb
             y_lsb_adc = y_lsb_adc * s_adc_lsb
 
-        # 7) Reconstruct: (D_MSB << 8 + D_LSB) >> 8, then apply real scale
-        global_scale = act_scale * w_scale * 256.0
-        y = y_msb_adc.to(torch.float32) * global_scale + y_lsb_adc.to(torch.float32) * (global_scale / 256.0)
+        # 7) Reconstruct with configured overlap (e.g., 4-bit overlap -> shift 4), then apply real scale
+        slice_scale = float(2 ** self.slice_shift)
+        global_scale = act_scale * w_scale * slice_scale
+        y = y_msb_adc.to(torch.float32) * global_scale + y_lsb_adc.to(torch.float32) * (global_scale / slice_scale)
 
         if self.bias is not None:
             y = y + self.bias.float()
@@ -321,7 +338,9 @@ class SwiGLUFFN(nn.Module):
         static_scales: dict | None = None,
         static_qweights: dict | None = None,
         weight_clip_pct: float = 0.0,
-        weight_nbit: int = 8
+        weight_nbit: int = 8,
+        act_nbit_eff: int = 12,
+        overlap_bits: int | None = None
     ) -> None:
         super().__init__()
         hidden_dim = int(hidden_dim * 2 / 3)
@@ -329,8 +348,10 @@ class SwiGLUFFN(nn.Module):
         self.use_bitserial = fake_quant
         self.weight_nbit = weight_nbit
         if self.use_bitserial:
-            self.w12 = BitSerialLinearW8A16(dim, 2 * hidden_dim, bias=bias, adc_nbit=12, weight_clip_pct=weight_clip_pct, weight_nbit=weight_nbit)
-            self.w3 = BitSerialLinearW8A16(hidden_dim, dim, bias=bias, adc_nbit=12, weight_clip_pct=weight_clip_pct, weight_nbit=weight_nbit)
+            self.w12 = BitSerialLinearW8A16(dim, 2 * hidden_dim, bias=bias, adc_nbit=12, weight_clip_pct=weight_clip_pct, weight_nbit=weight_nbit,
+                                            act_nbit_eff=act_nbit_eff, overlap_bits=overlap_bits)
+            self.w3 = BitSerialLinearW8A16(hidden_dim, dim, bias=bias, adc_nbit=12, weight_clip_pct=weight_clip_pct, weight_nbit=weight_nbit,
+                                           act_nbit_eff=act_nbit_eff, overlap_bits=overlap_bits)
         else:
             self.w12 = nn.Linear(dim, 2 * hidden_dim, bias=bias)
             self.w3 = nn.Linear(hidden_dim, dim, bias=bias)
@@ -447,7 +468,7 @@ class FinalLayer(nn.Module):
 class JiTBlock(nn.Module):
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, attn_drop=0.0, proj_drop=0.0, fake_quant_ffn: bool = False,
                  ffn_static_scales: dict | None = None, ffn_static_qweights: dict | None = None, ffn_weight_clip_pct: float = 0.0,
-                 ffn_weight_nbit: int = 8):
+                 ffn_weight_nbit: int = 8, ffn_act_nbit_eff: int = 12, ffn_overlap_bits: int | None = None):
         super().__init__()
         self.norm1 = RMSNorm(hidden_size, eps=1e-6)
         self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, qk_norm=True,
@@ -456,7 +477,8 @@ class JiTBlock(nn.Module):
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         self.mlp = SwiGLUFFN(hidden_size, mlp_hidden_dim, drop=proj_drop, fake_quant=fake_quant_ffn,
                              static_scales=ffn_static_scales, static_qweights=ffn_static_qweights,
-                             weight_clip_pct=ffn_weight_clip_pct, weight_nbit=ffn_weight_nbit)
+                             weight_clip_pct=ffn_weight_clip_pct, weight_nbit=ffn_weight_nbit,
+                             act_nbit_eff=ffn_act_nbit_eff, overlap_bits=ffn_overlap_bits)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
@@ -493,7 +515,9 @@ class JiT(nn.Module):
         ffn_scales_path: str = '',
         ffn_int7_weights_path: str = '',
         ffn_weight_clip_pct: float = 0.0,
-        ffn_weight_nbit: int = 8
+        ffn_weight_nbit: int = 8,
+        ffn_act_nbit_eff: int = 12,
+        ffn_overlap_bits: int | None = None
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -506,6 +530,8 @@ class JiT(nn.Module):
         self.in_context_start = in_context_start
         self.num_classes = num_classes
         self.ffn_weight_clip_pct = ffn_weight_clip_pct
+        self.ffn_act_nbit_eff = ffn_act_nbit_eff
+        self.ffn_overlap_bits = ffn_overlap_bits
 
         # time and class embed
         self.t_embedder = TimestepEmbedder(hidden_size)
@@ -553,7 +579,9 @@ class JiT(nn.Module):
                              ffn_static_scales=scales_i if scales_i else None,
                              ffn_static_qweights=qweights_i if qweights_i else None,
                              ffn_weight_clip_pct=ffn_weight_clip_pct,
-                             ffn_weight_nbit=ffn_weight_nbit)
+                             ffn_weight_nbit=ffn_weight_nbit,
+                             ffn_act_nbit_eff=ffn_act_nbit_eff,
+                             ffn_overlap_bits=ffn_overlap_bits)
             self.blocks.append(block)
 
         # linear predict
