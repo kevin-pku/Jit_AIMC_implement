@@ -80,18 +80,21 @@ def modulate(x, shift, scale):
 
 class BitSerialLinearW8A16(nn.Module):
     """
-    Bit-serial input CIM-style Linear with INT8 weights and virtual INT16 activations.
+    Bit-serial input CIM-style Linear with INTn weights (default INT8) and virtual INT16 activations.
     Slicing/Reconstruction are forced to float32 to preserve LSB contribution under BF16 autocast.
     """
 
-    def __init__(self, in_features: int, out_features: int, bias: bool = True, adc_nbit: int = 10, weight_clip_pct: float = 0.0):
+    def __init__(self, in_features: int, out_features: int, bias: bool = True, adc_nbit: int = 10, weight_clip_pct: float = 0.0, weight_nbit: int = 8):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.adc_nbit = adc_nbit
         self.weight_clip_pct = weight_clip_pct
+        self.weight_nbit = weight_nbit
         self.qmax_adc = (1 << (adc_nbit - 1)) - 1
         self.qmin_adc = - (1 << (adc_nbit - 1))
+        self.qmax_w = (1 << (weight_nbit - 1)) - 1
+        self.qmin_w = - (1 << (weight_nbit - 1))
 
         # Master FP32 weights
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
@@ -124,8 +127,8 @@ class BitSerialLinearW8A16(nn.Module):
                 clip_val = torch.quantile(w_in_process.abs(), self.weight_clip_pct / 100.0)
                 w_in_process = torch.clamp(w_in_process, -clip_val, clip_val)
             max_abs_w = torch.max(w_in_process.abs())
-            w_scale = torch.clamp(max_abs_w / 127.0, min=1e-8)
-            w_int = torch.clamp(torch.round(w_in_process / w_scale), -128, 127)
+            w_scale = torch.clamp(max_abs_w / float(self.qmax_w), min=1e-8)
+            w_int = torch.clamp(torch.round(w_in_process / w_scale), self.qmin_w, self.qmax_w)
 
         w_scale = w_scale.to(dtype=torch.float32, device=x.device)
         w_int = w_int.to(dtype=torch.float32, device=x.device)
@@ -317,15 +320,17 @@ class SwiGLUFFN(nn.Module):
         fake_quant: bool = False,
         static_scales: dict | None = None,
         static_qweights: dict | None = None,
-        weight_clip_pct: float = 0.0
+        weight_clip_pct: float = 0.0,
+        weight_nbit: int = 8
     ) -> None:
         super().__init__()
         hidden_dim = int(hidden_dim * 2 / 3)
         # If启用假量化，则用位切分 W8A16 线性阵列；否则常规 Linear。
         self.use_bitserial = fake_quant
+        self.weight_nbit = weight_nbit
         if self.use_bitserial:
-            self.w12 = BitSerialLinearW8A16(dim, 2 * hidden_dim, bias=bias, adc_nbit=12, weight_clip_pct=weight_clip_pct)
-            self.w3 = BitSerialLinearW8A16(hidden_dim, dim, bias=bias, adc_nbit=12, weight_clip_pct=weight_clip_pct)
+            self.w12 = BitSerialLinearW8A16(dim, 2 * hidden_dim, bias=bias, adc_nbit=12, weight_clip_pct=weight_clip_pct, weight_nbit=weight_nbit)
+            self.w3 = BitSerialLinearW8A16(hidden_dim, dim, bias=bias, adc_nbit=12, weight_clip_pct=weight_clip_pct, weight_nbit=weight_nbit)
         else:
             self.w12 = nn.Linear(dim, 2 * hidden_dim, bias=bias)
             self.w3 = nn.Linear(hidden_dim, dim, bias=bias)
@@ -358,7 +363,7 @@ class SwiGLUFFN(nn.Module):
                 w12_q = w12_q.to(device=x.device, dtype=x.dtype)
                 self.static_qweights['w12.weight'] = w12_q
             else:
-                w12_q = _fake_quant(self.w12.weight, nbits=7, signed=True)
+                w12_q = _fake_quant(self.w12.weight, nbits=self.weight_nbit, signed=True)
             b12 = self.w12.bias
             x12 = torch.matmul(x_in, w12_q.t())
             if b12 is not None:
@@ -398,7 +403,7 @@ class SwiGLUFFN(nn.Module):
                 w3_q = w3_q.to(device=hidden.device, dtype=hidden.dtype)
                 self.static_qweights['w3.weight'] = w3_q
             else:
-                w3_q = _fake_quant(self.w3.weight, nbits=7, signed=True)
+                w3_q = _fake_quant(self.w3.weight, nbits=self.weight_nbit, signed=True)
             b3 = self.w3.bias
             out = torch.matmul(hidden_q, w3_q.t())
             if b3 is not None:
@@ -441,7 +446,8 @@ class FinalLayer(nn.Module):
 
 class JiTBlock(nn.Module):
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, attn_drop=0.0, proj_drop=0.0, fake_quant_ffn: bool = False,
-                 ffn_static_scales: dict | None = None, ffn_static_qweights: dict | None = None, ffn_weight_clip_pct: float = 0.0):
+                 ffn_static_scales: dict | None = None, ffn_static_qweights: dict | None = None, ffn_weight_clip_pct: float = 0.0,
+                 ffn_weight_nbit: int = 8):
         super().__init__()
         self.norm1 = RMSNorm(hidden_size, eps=1e-6)
         self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, qk_norm=True,
@@ -450,7 +456,7 @@ class JiTBlock(nn.Module):
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         self.mlp = SwiGLUFFN(hidden_size, mlp_hidden_dim, drop=proj_drop, fake_quant=fake_quant_ffn,
                              static_scales=ffn_static_scales, static_qweights=ffn_static_qweights,
-                             weight_clip_pct=ffn_weight_clip_pct)
+                             weight_clip_pct=ffn_weight_clip_pct, weight_nbit=ffn_weight_nbit)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
@@ -486,7 +492,8 @@ class JiT(nn.Module):
         ffn_fake_quant: bool = False,
         ffn_scales_path: str = '',
         ffn_int7_weights_path: str = '',
-        ffn_weight_clip_pct: float = 0.0
+        ffn_weight_clip_pct: float = 0.0,
+        ffn_weight_nbit: int = 8
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -545,7 +552,8 @@ class JiT(nn.Module):
                              fake_quant_ffn=ffn_fake_quant,
                              ffn_static_scales=scales_i if scales_i else None,
                              ffn_static_qweights=qweights_i if qweights_i else None,
-                             ffn_weight_clip_pct=ffn_weight_clip_pct)
+                             ffn_weight_clip_pct=ffn_weight_clip_pct,
+                             ffn_weight_nbit=ffn_weight_nbit)
             self.blocks.append(block)
 
         # linear predict
