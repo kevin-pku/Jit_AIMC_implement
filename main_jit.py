@@ -114,6 +114,8 @@ def get_args_parser():
                         help='Path to pre-quantized FFN INT7 weights state_dict; optional')
     parser.add_argument('--ffn_weight_clip_pct', default=0.0, type=float,
                         help='Optional percentile clipping (e.g., 99.9) on FFN weights before quantization in bit-serial mode')
+    parser.add_argument('--ffn_weight_nbit', default=8, type=int,
+                        help='Bitwidth for FFN bit-serial weight quantization (e.g., 8 for INT8, 7 for INT7)')
     parser.add_argument('--keep_generated', action='store_true',
                         help='Do not delete generated samples after FID/IS (for exporting)')
     parser.add_argument('--fid_stats_path', default='', type=str,
