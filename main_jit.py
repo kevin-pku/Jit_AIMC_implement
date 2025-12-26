@@ -106,9 +106,9 @@ def get_args_parser():
         choices=[0, 1, 2],
         help='Which EMA to use during evaluation: 0 = no EMA, 1 = ema_decay1 (default), 2 = ema_decay2.'
     )
-    parser.add_argument('--ffn_fake_quant', '--ffn_bitserial', dest='ffn_bitserial', action=argparse.BooleanOptionalAction,
+    parser.add_argument('--ffn_bitserial', dest='ffn_bitserial', action=argparse.BooleanOptionalAction,
                         default=True,
-                        help='Enable FFN bit-serial CIM simulation (INT8 weights, configurable effective activation and ADC bits) during inference; disable with --no-ffn-bitserial/--no-ffn-fake-quant')
+                        help='Enable FFN bit-serial CIM simulation (INT8 weights, configurable effective activation and ADC bits) during inference; disable with --no-ffn-bitserial')
     parser.add_argument('--ffn_use_kl_scales', default='', type=str,
                         help='Path to FFN KL calibration scales (json/npz) for static quant; optional')
     parser.add_argument('--ffn_int7_weights', default='', type=str,

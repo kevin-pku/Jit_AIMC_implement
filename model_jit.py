@@ -25,50 +25,6 @@ def jit_compile(fn):
     return torch.compile(fn)
 
 
-# Fake-quant helpers for KL quantization simulation
-def _fake_quant(t: torch.Tensor, nbits: int, signed: bool = True, eps: float = 1e-8):
-    qmax = (1 << (nbits - 1)) - 1 if signed else (1 << nbits) - 1
-    qmin = - (1 << (nbits - 1)) if signed else 0
-    max_abs = torch.max(t.abs())
-    scale = torch.clamp(max_abs / qmax, min=eps)
-    t_q = torch.clamp(torch.round(t / scale), qmin, qmax) * scale
-    return t_q
-
-
-def _fake_adc_nbit(t: torch.Tensor, nbits: int = 12):
-    qmax = (1 << (nbits - 1)) - 1
-    qmin = - (1 << (nbits - 1))
-    return torch.clamp(torch.round(t), qmin, qmax)
-
-
-def _quant_signed(t: torch.Tensor, nbits: int, eps: float = 1e-8):
-    qmax = (1 << (nbits - 1)) - 1
-    qmin = - (1 << (nbits - 1))
-    max_abs = torch.max(t.abs())
-    scale = torch.clamp(max_abs / qmax, min=eps)
-    q = torch.clamp(torch.round(t / scale), qmin, qmax)
-    return q * scale, scale
-
-
-def _quant_int_signed(t: torch.Tensor, nbits: int, eps: float = 1e-8):
-    """Return integer quantized tensor and scale (symmetric, per-tensor)."""
-    qmax = (1 << (nbits - 1)) - 1
-    qmin = - (1 << (nbits - 1))
-    max_abs = torch.max(t.abs())
-    scale = torch.clamp(max_abs / qmax, min=eps)
-    q = torch.clamp(torch.round(t / scale), qmin, qmax)
-    return q, scale
-
-
-def _static_quant(t: torch.Tensor, scale: torch.Tensor, nbits: int, signed: bool = True):
-    qmax = (1 << (nbits - 1)) - 1 if signed else (1 << nbits) - 1
-    qmin = - (1 << (nbits - 1)) if signed else 0
-    scale = scale.to(device=t.device, dtype=t.dtype)
-    t = t / scale
-    t = torch.clamp(torch.round(t), qmin, qmax)
-    return t * scale
-
-
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
