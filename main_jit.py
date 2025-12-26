@@ -106,8 +106,8 @@ def get_args_parser():
         choices=[0, 1, 2],
         help='Which EMA to use during evaluation: 0 = no EMA, 1 = ema_decay1 (default), 2 = ema_decay2.'
     )
-    parser.add_argument('--ffn_fake_quant', action='store_true',
-                        help='Enable FFN fake quantization (INT8 activations, INT7 weights, 10-bit ADC clamp) during inference')
+    parser.add_argument('--ffn_fake_quant', '--ffn_bitserial', dest='ffn_bitserial', action='store_true',
+                        help='Enable FFN bit-serial CIM simulation (INT8 weights, configurable effective activation and ADC bits) during inference')
     parser.add_argument('--ffn_use_kl_scales', default='', type=str,
                         help='Path to FFN KL calibration scales (json/npz) for static quant; optional')
     parser.add_argument('--ffn_int7_weights', default='', type=str,
@@ -120,6 +120,8 @@ def get_args_parser():
                         help='Effective activation bitwidth for bit-serial CIM simulation (e.g., 12 for W8A12 with noise budget)')
     parser.add_argument('--ffn_overlap_bits', default=None, type=int,
                         help='Optional overlap bits between the two 8-bit slices; default auto-computes overlap to reach the desired effective activation bitwidth')
+    parser.add_argument('--ffn_adc_nbit', default=10, type=int,
+                        help='ADC bitwidth used in bit-serial CIM simulation (default 10)')
     parser.add_argument('--keep_generated', action='store_true',
                         help='Do not delete generated samples after FID/IS (for exporting)')
     parser.add_argument('--fid_stats_path', default='', type=str,

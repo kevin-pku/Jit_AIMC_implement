@@ -102,7 +102,7 @@ def build_denoiser_from_checkpoint(args, device):
         interval_max=1.0,
         ema_decay1=0.9999,
         ema_decay2=0.9996,
-        ffn_fake_quant=False,
+        ffn_bitserial=False,
         ffn_use_kl_scales='',
         ffn_int7_weights='',
     )
@@ -130,7 +130,7 @@ def build_denoiser_from_checkpoint(args, device):
         cfg=ckpt_args.cfg,
         interval_min=ckpt_args.interval_min,
         interval_max=ckpt_args.interval_max,
-        ffn_fake_quant=False,
+        ffn_bitserial=False,
         ffn_use_kl_scales='',
         ffn_int7_weights='',
     )

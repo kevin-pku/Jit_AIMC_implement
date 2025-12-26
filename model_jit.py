@@ -35,11 +35,6 @@ def _fake_quant(t: torch.Tensor, nbits: int, signed: bool = True, eps: float = 1
     return t_q
 
 
-def _fake_adc_10bit(t: torch.Tensor):
-    # Simulate 10-bit signed ADC levels [-512, 511]
-    return torch.clamp(torch.round(t), -512, 511)
-
-
 def _fake_adc_nbit(t: torch.Tensor, nbits: int = 12):
     qmax = (1 << (nbits - 1)) - 1
     qmin = - (1 << (nbits - 1))
@@ -334,70 +329,50 @@ class SwiGLUFFN(nn.Module):
         hidden_dim: int,
         drop=0.0,
         bias=True,
-        fake_quant: bool = False,
+        bitserial: bool = False,
         static_scales: dict | None = None,
         static_qweights: dict | None = None,
         weight_clip_pct: float = 0.0,
         weight_nbit: int = 8,
         act_nbit_eff: int = 12,
-        overlap_bits: int | None = None
+        overlap_bits: int | None = None,
+        adc_nbit: int = 10,
     ) -> None:
         super().__init__()
         hidden_dim = int(hidden_dim * 2 / 3)
-        # If启用假量化，则用位切分 W8A16 线性阵列；否则常规 Linear。
-        self.use_bitserial = fake_quant
+        # If启用位串行，则用位切分 W8A16 线性阵列；否则常规 Linear。
+        self.use_bitserial = bitserial
         self.weight_nbit = weight_nbit
         if self.use_bitserial:
-            self.w12 = BitSerialLinearW8A16(dim, 2 * hidden_dim, bias=bias, adc_nbit=12, weight_clip_pct=weight_clip_pct, weight_nbit=weight_nbit,
+            self.w12 = BitSerialLinearW8A16(dim, 2 * hidden_dim, bias=bias, adc_nbit=adc_nbit, weight_clip_pct=weight_clip_pct, weight_nbit=weight_nbit,
                                             act_nbit_eff=act_nbit_eff, overlap_bits=overlap_bits)
-            self.w3 = BitSerialLinearW8A16(hidden_dim, dim, bias=bias, adc_nbit=12, weight_clip_pct=weight_clip_pct, weight_nbit=weight_nbit,
+            self.w3 = BitSerialLinearW8A16(hidden_dim, dim, bias=bias, adc_nbit=adc_nbit, weight_clip_pct=weight_clip_pct, weight_nbit=weight_nbit,
                                            act_nbit_eff=act_nbit_eff, overlap_bits=overlap_bits)
         else:
             self.w12 = nn.Linear(dim, 2 * hidden_dim, bias=bias)
             self.w3 = nn.Linear(hidden_dim, dim, bias=bias)
         self.ffn_dropout = nn.Dropout(drop)
-        self.fake_quant = fake_quant
         self.static_scales = static_scales or {}
-        # Force dynamic weight quant; ignore provided static_qweights
-        self.static_qweights = {}
+        self.static_qweights = static_qweights or {}
         self.weight_clip_pct = weight_clip_pct
 
     def forward(self, x):
         if self.use_bitserial:
             act_scale_w12 = self.static_scales.get('w12_act')
             if act_scale_w12 is not None:
-                act_scale_w12 = act_scale_w12.to(device=x.device, dtype=x.dtype) if torch.is_tensor(act_scale_w12) else torch.tensor(act_scale_w12, device=x.device, dtype=x.dtype)
+                act_scale_w12 = act_scale_w12.to(device=x.device, dtype=torch.float32) if torch.is_tensor(act_scale_w12) else torch.tensor(act_scale_w12, device=x.device, dtype=torch.float32)
 
-            # Pass None to force dynamic weight scale from FP32 weights
-            x12 = self.w12(x, act_scale=act_scale_w12, w_int=None, w_scale=None)
-        elif self.fake_quant:
-            if 'w12_act' in self.static_scales:
-                act_scale = self.static_scales['w12_act']
-                act_scale = act_scale.to(device=x.device, dtype=x.dtype) if torch.is_tensor(act_scale) else torch.tensor(act_scale, device=x.device, dtype=x.dtype)
-                self.static_scales['w12_act'] = act_scale
-                x_in = _static_quant(x, act_scale, nbits=8, signed=True)
-            else:
-                x_in = _fake_quant(x, nbits=8, signed=True)
-
+            w12_int = None
+            w12_scale = None
             if 'w12.weight' in self.static_qweights:
                 w12_q = self.static_qweights['w12.weight']
-                w12_q = w12_q.to(device=x.device, dtype=x.dtype)
+                w12_q = w12_q.to(device=x.device, dtype=torch.float32)
                 self.static_qweights['w12.weight'] = w12_q
-            else:
-                w12_q = _fake_quant(self.w12.weight, nbits=self.weight_nbit, signed=True)
-            b12 = self.w12.bias
-            x12 = torch.matmul(x_in, w12_q.t())
-            if b12 is not None:
-                x12 = x12 + b12
+                max_abs_w = torch.max(w12_q.abs())
+                w12_scale = torch.clamp(max_abs_w / float(self.w12.qmax_w), min=1e-8)
+                w12_int = torch.clamp(torch.round(w12_q / w12_scale), self.w12.qmin_w, self.w12.qmax_w)
 
-            if 'w12_acc' in self.static_scales:
-                acc_scale = self.static_scales['w12_acc']
-                acc_scale = acc_scale.to(device=x12.device, dtype=x12.dtype) if torch.is_tensor(acc_scale) else torch.tensor(acc_scale, device=x12.device, dtype=x12.dtype)
-                self.static_scales['w12_acc'] = acc_scale
-                qmax_adc, qmin_adc = 511, -512
-                x12 = torch.clamp(torch.round(x12 / acc_scale), qmin_adc, qmax_adc) * acc_scale
-            else:
-                x12 = _fake_adc_10bit(x12)
+            x12 = self.w12(x, act_scale=act_scale_w12, w_int=w12_int, w_scale=w12_scale)
         else:
             x12 = self.w12(x)
 
@@ -407,37 +382,19 @@ class SwiGLUFFN(nn.Module):
         if self.use_bitserial:
             act_scale_w3 = self.static_scales.get('w3_act')
             if act_scale_w3 is not None:
-                act_scale_w3 = act_scale_w3.to(device=hidden.device, dtype=hidden.dtype) if torch.is_tensor(act_scale_w3) else torch.tensor(act_scale_w3, device=hidden.device, dtype=hidden.dtype)
+                act_scale_w3 = act_scale_w3.to(device=hidden.device, dtype=torch.float32) if torch.is_tensor(act_scale_w3) else torch.tensor(act_scale_w3, device=hidden.device, dtype=torch.float32)
 
-            out = self.w3(hidden, act_scale=act_scale_w3, w_int=None, w_scale=None)
-        elif self.fake_quant:
-            if 'w3_act' in self.static_scales:
-                act_scale = self.static_scales['w3_act']
-                act_scale = act_scale.to(device=hidden.device, dtype=hidden.dtype) if torch.is_tensor(act_scale) else torch.tensor(act_scale, device=hidden.device, dtype=hidden.dtype)
-                self.static_scales['w3_act'] = act_scale
-                hidden_q = _static_quant(hidden, act_scale, nbits=8, signed=True)
-            else:
-                hidden_q = _fake_quant(hidden, nbits=8, signed=True)
-
+            w3_int = None
+            w3_scale = None
             if 'w3.weight' in self.static_qweights:
                 w3_q = self.static_qweights['w3.weight']
-                w3_q = w3_q.to(device=hidden.device, dtype=hidden.dtype)
+                w3_q = w3_q.to(device=hidden.device, dtype=torch.float32)
                 self.static_qweights['w3.weight'] = w3_q
-            else:
-                w3_q = _fake_quant(self.w3.weight, nbits=self.weight_nbit, signed=True)
-            b3 = self.w3.bias
-            out = torch.matmul(hidden_q, w3_q.t())
-            if b3 is not None:
-                out = out + b3
+                max_abs_w = torch.max(w3_q.abs())
+                w3_scale = torch.clamp(max_abs_w / float(self.w3.qmax_w), min=1e-8)
+                w3_int = torch.clamp(torch.round(w3_q / w3_scale), self.w3.qmin_w, self.w3.qmax_w)
 
-            if 'w3_acc' in self.static_scales:
-                acc_scale = self.static_scales['w3_acc']
-                acc_scale = acc_scale.to(device=out.device, dtype=out.dtype) if torch.is_tensor(acc_scale) else torch.tensor(acc_scale, device=out.device, dtype=out.dtype)
-                self.static_scales['w3_acc'] = acc_scale
-                qmax_adc, qmin_adc = 511, -512
-                out = torch.clamp(torch.round(out / acc_scale), qmin_adc, qmax_adc) * acc_scale
-            else:
-                out = _fake_adc_10bit(out)
+            out = self.w3(hidden, act_scale=act_scale_w3, w_int=w3_int, w_scale=w3_scale)
         else:
             out = self.w3(hidden)
 
@@ -466,19 +423,19 @@ class FinalLayer(nn.Module):
 
 
 class JiTBlock(nn.Module):
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, attn_drop=0.0, proj_drop=0.0, fake_quant_ffn: bool = False,
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, attn_drop=0.0, proj_drop=0.0, bitserial_ffn: bool = False,
                  ffn_static_scales: dict | None = None, ffn_static_qweights: dict | None = None, ffn_weight_clip_pct: float = 0.0,
-                 ffn_weight_nbit: int = 8, ffn_act_nbit_eff: int = 12, ffn_overlap_bits: int | None = None):
+                 ffn_weight_nbit: int = 8, ffn_act_nbit_eff: int = 12, ffn_overlap_bits: int | None = None, ffn_adc_nbit: int = 10):
         super().__init__()
         self.norm1 = RMSNorm(hidden_size, eps=1e-6)
         self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, qk_norm=True,
                               attn_drop=attn_drop, proj_drop=proj_drop)
         self.norm2 = RMSNorm(hidden_size, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
-        self.mlp = SwiGLUFFN(hidden_size, mlp_hidden_dim, drop=proj_drop, fake_quant=fake_quant_ffn,
+        self.mlp = SwiGLUFFN(hidden_size, mlp_hidden_dim, drop=proj_drop, bitserial=bitserial_ffn,
                              static_scales=ffn_static_scales, static_qweights=ffn_static_qweights,
                              weight_clip_pct=ffn_weight_clip_pct, weight_nbit=ffn_weight_nbit,
-                             act_nbit_eff=ffn_act_nbit_eff, overlap_bits=ffn_overlap_bits)
+                             act_nbit_eff=ffn_act_nbit_eff, overlap_bits=ffn_overlap_bits, adc_nbit=ffn_adc_nbit)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
@@ -511,13 +468,14 @@ class JiT(nn.Module):
         bottleneck_dim=128,
         in_context_len=32,
         in_context_start=8,
-        ffn_fake_quant: bool = False,
+        ffn_bitserial: bool = False,
         ffn_scales_path: str = '',
         ffn_int7_weights_path: str = '',
         ffn_weight_clip_pct: float = 0.0,
         ffn_weight_nbit: int = 8,
         ffn_act_nbit_eff: int = 12,
-        ffn_overlap_bits: int | None = None
+        ffn_overlap_bits: int | None = None,
+        ffn_adc_nbit: int = 10,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -532,6 +490,7 @@ class JiT(nn.Module):
         self.ffn_weight_clip_pct = ffn_weight_clip_pct
         self.ffn_act_nbit_eff = ffn_act_nbit_eff
         self.ffn_overlap_bits = ffn_overlap_bits
+        self.ffn_adc_nbit = ffn_adc_nbit
 
         # time and class embed
         self.t_embedder = TimestepEmbedder(hidden_size)
@@ -575,13 +534,14 @@ class JiT(nn.Module):
             block = JiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio,
                              attn_drop=attn_drop if (depth // 4 * 3 > i >= depth // 4) else 0.0,
                              proj_drop=proj_drop if (depth // 4 * 3 > i >= depth // 4) else 0.0,
-                             fake_quant_ffn=ffn_fake_quant,
+                             bitserial_ffn=ffn_bitserial,
                              ffn_static_scales=scales_i if scales_i else None,
                              ffn_static_qweights=qweights_i if qweights_i else None,
                              ffn_weight_clip_pct=ffn_weight_clip_pct,
                              ffn_weight_nbit=ffn_weight_nbit,
                              ffn_act_nbit_eff=ffn_act_nbit_eff,
-                             ffn_overlap_bits=ffn_overlap_bits)
+                             ffn_overlap_bits=ffn_overlap_bits,
+                             ffn_adc_nbit=ffn_adc_nbit)
             self.blocks.append(block)
 
         # linear predict
