@@ -329,7 +329,7 @@ class SwiGLUFFN(nn.Module):
         hidden_dim: int,
         drop=0.0,
         bias=True,
-        bitserial: bool = False,
+        bitserial: bool = True,
         static_scales: dict | None = None,
         static_qweights: dict | None = None,
         weight_clip_pct: float = 0.0,
@@ -340,7 +340,7 @@ class SwiGLUFFN(nn.Module):
     ) -> None:
         super().__init__()
         hidden_dim = int(hidden_dim * 2 / 3)
-        # If启用位串行，则用位切分 W8A16 线性阵列；否则常规 Linear。
+        # 默认启用位串行，走等效 W8A12（可调激活精度）的 2-pass 位切分；如需禁用则退回常规 Linear。
         self.use_bitserial = bitserial
         self.weight_nbit = weight_nbit
         if self.use_bitserial:
@@ -423,7 +423,7 @@ class FinalLayer(nn.Module):
 
 
 class JiTBlock(nn.Module):
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, attn_drop=0.0, proj_drop=0.0, bitserial_ffn: bool = False,
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, attn_drop=0.0, proj_drop=0.0, bitserial_ffn: bool = True,
                  ffn_static_scales: dict | None = None, ffn_static_qweights: dict | None = None, ffn_weight_clip_pct: float = 0.0,
                  ffn_weight_nbit: int = 8, ffn_act_nbit_eff: int = 12, ffn_overlap_bits: int | None = None, ffn_adc_nbit: int = 10):
         super().__init__()
@@ -468,7 +468,7 @@ class JiT(nn.Module):
         bottleneck_dim=128,
         in_context_len=32,
         in_context_start=8,
-        ffn_bitserial: bool = False,
+        ffn_bitserial: bool = True,
         ffn_scales_path: str = '',
         ffn_int7_weights_path: str = '',
         ffn_weight_clip_pct: float = 0.0,

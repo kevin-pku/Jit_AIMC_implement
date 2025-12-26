@@ -43,4 +43,4 @@
 
 ## 量化/硬件相关小贴士
 - 环境变量 `BIT_SERIAL_ADC_BYPASS` 可跳过 ADC 量化，`BIT_SERIAL_SINGLE_PASS` 可禁用位切分；`JIT_DISABLE_TORCH_COMPILE` 可关闭 `torch.compile` 以方便调试。【F:model_jit.py†L18-L25】【F:model_jit.py†L117-L119】【F:model_jit.py†L164-L176】
-- `main_jit.py` 暴露 `--ffn_bitserial/--ffn_use_kl_scales/--ffn_int7_weights/--ffn_weight_clip_pct/--ffn_act_nbit/--ffn_overlap_bits/--ffn_adc_nbit`，可在推理时灵活切换动态/静态量化、有效位宽与权重裁剪策略。【F:main_jit.py†L109-L151】
+- `main_jit.py` 暴露 `--[no-]ffn_bitserial/--ffn_use_kl_scales/--ffn_int7_weights/--ffn_weight_clip_pct/--ffn_act_nbit/--ffn_overlap_bits/--ffn_adc_nbit`，默认走等效 W8A12 位串行路径，可在推理时灵活切换动态/静态量化、有效位宽与权重裁剪策略。【F:main_jit.py†L109-L151】
