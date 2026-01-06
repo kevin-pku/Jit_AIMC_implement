@@ -39,7 +39,7 @@ class BitSerialLinearW8A16(nn.Module):
     """
 
     def __init__(self, in_features: int, out_features: int, bias: bool = True, adc_nbit: int = 10, weight_clip_pct: float = 0.0, weight_nbit: int = 8,
-                 act_nbit_eff: int = 12, msb_samples: int = 2, lsb_gain_shift: int = 2):
+                 act_nbit_eff: int = 12, msb_samples: int = 2, lsb_gain_shift: int = 2, msb_noise_sigma_lsb: float = 2.0):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
@@ -58,6 +58,7 @@ class BitSerialLinearW8A16(nn.Module):
         self.lsb_gain_shift = int(lsb_gain_shift)
         if self.lsb_gain_shift < 0:
             raise ValueError(f"lsb_gain_shift must be non-negative, got {self.lsb_gain_shift}")
+        self.msb_noise_sigma_lsb = float(msb_noise_sigma_lsb)
         self.qmax_adc = (1 << (adc_nbit - 1)) - 1
         self.qmin_adc = - (1 << (adc_nbit - 1))
         self.qmax_w = (1 << (weight_nbit - 1)) - 1
@@ -187,11 +188,12 @@ class BitSerialLinearW8A16(nn.Module):
                 else:
                     s_adc_lsb = y_lsb_raw.abs().max() / float(self.qmax_adc) + 1e-8
             # Inject effective thermal noise on the averaged MSB path before ADC quantization.
-            # A 2 LSB single-sample sigma is reduced by sqrt(msb_samples) due to averaging.
-            effective_sigma = 2.0 / math.sqrt(self.msb_samples)
-            y_msb_noisy = y_msb_raw + torch.randn_like(y_msb_raw) * (effective_sigma * s_adc_msb)
+            # A per-sample sigma (in ADC LSBs) is reduced by sqrt(msb_samples) due to averaging.
+            if self.msb_noise_sigma_lsb > 0:
+                effective_sigma = self.msb_noise_sigma_lsb / math.sqrt(self.msb_samples)
+                y_msb_raw = y_msb_raw + torch.randn_like(y_msb_raw) * (effective_sigma * s_adc_msb)
 
-            y_msb_adc = torch.clamp(torch.round(y_msb_noisy / s_adc_msb), self.qmin_adc, self.qmax_adc)
+            y_msb_adc = torch.clamp(torch.round(y_msb_raw / s_adc_msb), self.qmin_adc, self.qmax_adc)
             y_lsb_adc = torch.clamp(torch.round(y_lsb_raw / s_adc_lsb), self.qmin_adc, self.qmax_adc)
             y_msb_adc = y_msb_adc * s_adc_msb
             y_lsb_adc = y_lsb_adc * s_adc_lsb
@@ -345,6 +347,7 @@ class SwiGLUFFN(nn.Module):
         msb_samples: int = 2,
         lsb_gain_shift: int = 2,
         adc_nbit: int = 10,
+        msb_noise_sigma_lsb: float = 2.0,
     ) -> None:
         super().__init__()
         hidden_dim = int(hidden_dim * 2 / 3)
@@ -353,9 +356,11 @@ class SwiGLUFFN(nn.Module):
         self.weight_nbit = weight_nbit
         if self.use_bitserial:
             self.w12 = BitSerialLinearW8A16(dim, 2 * hidden_dim, bias=bias, adc_nbit=adc_nbit, weight_clip_pct=weight_clip_pct, weight_nbit=weight_nbit,
-                                            act_nbit_eff=act_nbit_eff, msb_samples=msb_samples, lsb_gain_shift=lsb_gain_shift)
+                                            act_nbit_eff=act_nbit_eff, msb_samples=msb_samples, lsb_gain_shift=lsb_gain_shift,
+                                            msb_noise_sigma_lsb=msb_noise_sigma_lsb)
             self.w3 = BitSerialLinearW8A16(hidden_dim, dim, bias=bias, adc_nbit=adc_nbit, weight_clip_pct=weight_clip_pct, weight_nbit=weight_nbit,
-                                           act_nbit_eff=act_nbit_eff, msb_samples=msb_samples, lsb_gain_shift=lsb_gain_shift)
+                                           act_nbit_eff=act_nbit_eff, msb_samples=msb_samples, lsb_gain_shift=lsb_gain_shift,
+                                           msb_noise_sigma_lsb=msb_noise_sigma_lsb)
         else:
             self.w12 = nn.Linear(dim, 2 * hidden_dim, bias=bias)
             self.w3 = nn.Linear(hidden_dim, dim, bias=bias)
@@ -439,7 +444,8 @@ class FinalLayer(nn.Module):
 class JiTBlock(nn.Module):
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, attn_drop=0.0, proj_drop=0.0, bitserial_ffn: bool = True,
                  ffn_static_scales: dict | None = None, ffn_static_qweights: dict | None = None, ffn_weight_clip_pct: float = 0.0,
-                 ffn_weight_nbit: int = 8, ffn_act_nbit_eff: int = 12, ffn_msb_samples: int = 2, ffn_lsb_gain_shift: int = 2, ffn_adc_nbit: int = 10):
+                 ffn_weight_nbit: int = 8, ffn_act_nbit_eff: int = 12, ffn_msb_samples: int = 2, ffn_lsb_gain_shift: int = 2, ffn_adc_nbit: int = 10,
+                 ffn_msb_noise_sigma_lsb: float = 2.0):
         super().__init__()
         self.norm1 = RMSNorm(hidden_size, eps=1e-6)
         self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, qk_norm=True,
@@ -449,7 +455,8 @@ class JiTBlock(nn.Module):
         self.mlp = SwiGLUFFN(hidden_size, mlp_hidden_dim, drop=proj_drop, bitserial=bitserial_ffn,
                              static_scales=ffn_static_scales, static_qweights=ffn_static_qweights,
                              weight_clip_pct=ffn_weight_clip_pct, weight_nbit=ffn_weight_nbit,
-                             act_nbit_eff=ffn_act_nbit_eff, msb_samples=ffn_msb_samples, lsb_gain_shift=ffn_lsb_gain_shift, adc_nbit=ffn_adc_nbit)
+                             act_nbit_eff=ffn_act_nbit_eff, msb_samples=ffn_msb_samples, lsb_gain_shift=ffn_lsb_gain_shift, adc_nbit=ffn_adc_nbit,
+                             msb_noise_sigma_lsb=ffn_msb_noise_sigma_lsb)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
@@ -491,6 +498,7 @@ class JiT(nn.Module):
         ffn_msb_samples: int = 2,
         ffn_lsb_gain_shift: int = 2,
         ffn_adc_nbit: int = 10,
+        ffn_msb_noise_sigma_lsb: float = 2.0,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -507,6 +515,7 @@ class JiT(nn.Module):
         self.ffn_msb_samples = ffn_msb_samples
         self.ffn_lsb_gain_shift = ffn_lsb_gain_shift
         self.ffn_adc_nbit = ffn_adc_nbit
+        self.ffn_msb_noise_sigma_lsb = ffn_msb_noise_sigma_lsb
 
         # time and class embed
         self.t_embedder = TimestepEmbedder(hidden_size)
@@ -558,7 +567,8 @@ class JiT(nn.Module):
                              ffn_act_nbit_eff=ffn_act_nbit_eff,
                              ffn_msb_samples=ffn_msb_samples,
                              ffn_lsb_gain_shift=ffn_lsb_gain_shift,
-                             ffn_adc_nbit=ffn_adc_nbit)
+                             ffn_adc_nbit=ffn_adc_nbit,
+                             ffn_msb_noise_sigma_lsb=ffn_msb_noise_sigma_lsb)
             self.blocks.append(block)
 
         # linear predict

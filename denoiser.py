@@ -24,6 +24,7 @@ class Denoiser(nn.Module):
             ffn_msb_samples=getattr(args, 'ffn_msb_samples', 2),
             ffn_lsb_gain_shift=getattr(args, 'ffn_lsb_gain_shift', 2),
             ffn_adc_nbit=getattr(args, 'ffn_adc_nbit', 10),
+            ffn_msb_noise_sigma_lsb=getattr(args, 'ffn_msb_noise_sigma_lsb', 2.0),
         )
         self.img_size = args.img_size
         self.num_classes = args.class_num

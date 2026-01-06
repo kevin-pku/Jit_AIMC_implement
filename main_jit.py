@@ -125,6 +125,8 @@ def get_args_parser():
                         help='Left-shift applied to the 5-bit LSB slice before CIM (default 2 -> 4x DAC gain)')
     parser.add_argument('--ffn_adc_nbit', default=10, type=int,
                         help='ADC bitwidth used in bit-serial CIM simulation (default 10)')
+    parser.add_argument('--ffn_msb_noise_sigma_lsb', default=2.0, type=float,
+                        help='Gaussian noise sigma (in ADC LSBs) applied per MSB sample before averaging; set 0 to disable')
     parser.add_argument('--keep_generated', action='store_true',
                         help='Do not delete generated samples after FID/IS (for exporting)')
     parser.add_argument('--fid_stats_path', default='', type=str,

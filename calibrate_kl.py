@@ -108,6 +108,7 @@ def build_denoiser_from_checkpoint(args, device):
         ffn_msb_samples=2,
         ffn_lsb_gain_shift=2,
         ffn_adc_nbit=10,
+        ffn_msb_noise_sigma_lsb=0.0,
     )
     for k, v in defaults.items():
         if not hasattr(ckpt_args, k):
@@ -139,6 +140,7 @@ def build_denoiser_from_checkpoint(args, device):
         ffn_msb_samples=ckpt_args.ffn_msb_samples,
         ffn_lsb_gain_shift=ckpt_args.ffn_lsb_gain_shift,
         ffn_adc_nbit=ckpt_args.ffn_adc_nbit,
+        ffn_msb_noise_sigma_lsb=getattr(ckpt_args, 'ffn_msb_noise_sigma_lsb', 0.0),
     )
 
     denoiser = Denoiser(ns)
