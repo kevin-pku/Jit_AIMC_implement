@@ -25,76 +25,48 @@ def jit_compile(fn):
     return torch.compile(fn)
 
 
-# Fake-quant helpers for KL quantization simulation
-def _fake_quant(t: torch.Tensor, nbits: int, signed: bool = True, eps: float = 1e-8):
-    qmax = (1 << (nbits - 1)) - 1 if signed else (1 << nbits) - 1
-    qmin = - (1 << (nbits - 1)) if signed else 0
-    max_abs = torch.max(t.abs())
-    scale = torch.clamp(max_abs / qmax, min=eps)
-    t_q = torch.clamp(torch.round(t / scale), qmin, qmax) * scale
-    return t_q
-
-
-def _fake_adc_10bit(t: torch.Tensor):
-    # Simulate 10-bit signed ADC levels [-512, 511]
-    return torch.clamp(torch.round(t), -512, 511)
-
-
-def _fake_adc_nbit(t: torch.Tensor, nbits: int = 12):
-    qmax = (1 << (nbits - 1)) - 1
-    qmin = - (1 << (nbits - 1))
-    return torch.clamp(torch.round(t), qmin, qmax)
-
-
-def _quant_signed(t: torch.Tensor, nbits: int, eps: float = 1e-8):
-    qmax = (1 << (nbits - 1)) - 1
-    qmin = - (1 << (nbits - 1))
-    max_abs = torch.max(t.abs())
-    scale = torch.clamp(max_abs / qmax, min=eps)
-    q = torch.clamp(torch.round(t / scale), qmin, qmax)
-    return q * scale, scale
-
-
-def _quant_int_signed(t: torch.Tensor, nbits: int, eps: float = 1e-8):
-    """Return integer quantized tensor and scale (symmetric, per-tensor)."""
-    qmax = (1 << (nbits - 1)) - 1
-    qmin = - (1 << (nbits - 1))
-    max_abs = torch.max(t.abs())
-    scale = torch.clamp(max_abs / qmax, min=eps)
-    q = torch.clamp(torch.round(t / scale), qmin, qmax)
-    return q, scale
-
-
-def _static_quant(t: torch.Tensor, scale: torch.Tensor, nbits: int, signed: bool = True):
-    qmax = (1 << (nbits - 1)) - 1 if signed else (1 << nbits) - 1
-    qmin = - (1 << (nbits - 1)) if signed else 0
-    scale = scale.to(device=t.device, dtype=t.dtype)
-    t = t / scale
-    t = torch.clamp(torch.round(t), qmin, qmax)
-    return t * scale
-
-
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
 
 class BitSerialLinearW8A16(nn.Module):
     """
-    Bit-serial input CIM-style Linear with INTn weights (default INT8) and virtual INT16 activations.
-    Slicing/Reconstruction are forced to float32 to preserve LSB contribution under BF16 autocast.
+    Bit-serial input CIM-style Linear with INTn weights (default INT8) and virtual INT12 activations.
+    Implements 7-bit signed MSB + 5-bit unsigned LSB splitting with MSB multi-sampling and LSB DAC gain.
+
+    NOTE: The historical class name is kept for compatibility, but the effective activation flow is fixed
+    to INT12 (radix 32) per the Nor-Flash CIM specification.
     """
 
-    def __init__(self, in_features: int, out_features: int, bias: bool = True, adc_nbit: int = 10, weight_clip_pct: float = 0.0, weight_nbit: int = 8):
+    def __init__(self, in_features: int, out_features: int, bias: bool = True, adc_nbit: int = 10, weight_clip_pct: float = 0.0, weight_nbit: int = 8,
+                 act_nbit_eff: int = 12, msb_samples: int = 2, lsb_gain_shift: int = 2):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.adc_nbit = adc_nbit
         self.weight_clip_pct = weight_clip_pct
         self.weight_nbit = weight_nbit
+        if act_nbit_eff != 12:
+            raise ValueError(f"BitSerialLinearW8A16 now models fixed INT12 activations; got act_nbit_eff={act_nbit_eff}")
+        self.act_nbit_eff = act_nbit_eff
+        self.lsb_bits = 5
+        self.msb_bits = self.act_nbit_eff - self.lsb_bits
+        self.radix = 1 << self.lsb_bits  # 32
+        self.msb_samples = max(1, int(msb_samples))
+        if self.msb_samples > 4:
+            raise ValueError(f"msb_samples must be in [1,4], got {self.msb_samples}")
+        self.lsb_gain_shift = int(lsb_gain_shift)
+        if self.lsb_gain_shift < 0:
+            raise ValueError(f"lsb_gain_shift must be non-negative, got {self.lsb_gain_shift}")
         self.qmax_adc = (1 << (adc_nbit - 1)) - 1
         self.qmin_adc = - (1 << (adc_nbit - 1))
         self.qmax_w = (1 << (weight_nbit - 1)) - 1
         self.qmin_w = - (1 << (weight_nbit - 1))
+        self.qmax_act = (1 << (self.act_nbit_eff - 1)) - 1
+        self.qmin_act = - (1 << (self.act_nbit_eff - 1))
+        self.qmax_msb = (1 << (self.msb_bits - 1)) - 1
+        self.qmin_msb = - (1 << (self.msb_bits - 1))
+        self.qmax_lsb = (1 << self.lsb_bits) - 1
 
         # Master FP32 weights
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
@@ -113,7 +85,8 @@ class BitSerialLinearW8A16(nn.Module):
             bound = 1 / math.sqrt(fan_in)
             nn.init.uniform_(self.bias, -bound, bound)
 
-    def forward(self, x: torch.Tensor, act_scale: torch.Tensor | None = None, w_int: torch.Tensor | None = None, w_scale: torch.Tensor | None = None):
+    def forward(self, x: torch.Tensor, act_scale: torch.Tensor | None = None, w_int: torch.Tensor | None = None,
+                w_scale: torch.Tensor | None = None, adc_scale: torch.Tensor | float | tuple | list | None = None):
         # Force float32 to avoid BF16 swallowing LSB contributions
         x = x.float()
 
@@ -144,42 +117,83 @@ class BitSerialLinearW8A16(nn.Module):
                 y = y + self.bias.float()
             return y
 
-        # 2) Activation scale: trust provided scale; default to INT16 dynamic range when absent
+        # 2) Activation scale: use 99.5% percentile for symmetric INT12 quantization; clamp rare outliers
         if act_scale is None:
-            max_abs_act = torch.max(x.abs())
-            act_scale = torch.clamp(max_abs_act / 32767.0, min=1e-8)
+            with torch.no_grad():
+                max_abs_act = torch.quantile(x.detach().abs(), 0.995)
+            act_scale = torch.clamp(max_abs_act / float(self.qmax_act), min=1e-8)
         else:
             act_scale = act_scale.to(dtype=torch.float32)
         act_scale = act_scale.to(dtype=torch.float32, device=x.device)
+        clamp_val = self.qmax_act * act_scale
+        x_clamped = torch.clamp(x, -clamp_val, clamp_val)
 
-        # 3) Quantize activations to INT16 in float32 domain
-        x_int = torch.clamp(torch.round(x / act_scale), -32768, 32767)
+        # 3) Quantize activations to INT12 then decompose into 7-bit signed MSB and 5-bit unsigned LSB
+        x_int = torch.clamp(torch.round(x_clamped / act_scale), self.qmin_act, self.qmax_act)
+        x_int_i = x_int.to(dtype=torch.int32)
+        x_msb_int = torch.div(x_int_i, self.radix, rounding_mode='floor').clamp(self.qmin_msb, self.qmax_msb)
+        x_lsb_int = torch.bitwise_and(x_int_i, self.qmax_lsb)
 
-        # 4) Bit-slice per spec: arithmetic shift for MSB, mask-style LSB (0..255) with no pre-scaling
-        x_msb = torch.div(x_int, 256.0, rounding_mode='floor').clamp(-128, 127)
-        x_lsb = (x_int - x_msb * 256.0).clamp(0, 255)
+        x_msb = x_msb_int.to(dtype=torch.float32)
+        lsb_gain = float(1 << self.lsb_gain_shift)
+        x_lsb_gain = x_lsb_int.to(dtype=torch.float32) * lsb_gain
 
-        # 5) MVM in float32 (disable autocast)
+        # 5) MVM in float32 (disable autocast) with optional MSB multi-sampling
         with torch.cuda.amp.autocast(enabled=False):
-            y_msb_raw = F.linear(x_msb, w_int, bias=None)
-            y_lsb_raw = F.linear(x_lsb, w_int, bias=None)
+            y_msb_raw = None
+            for _ in range(self.msb_samples):
+                sample = F.linear(x_msb, w_int, bias=None)
+                y_msb_raw = sample if y_msb_raw is None else (y_msb_raw + sample)
+            y_msb_raw = y_msb_raw / float(self.msb_samples)
+            y_lsb_raw = F.linear(x_lsb_gain, w_int, bias=None)
 
-        # 6) ADC：MSB/LSB 各自独立增益（更贴近双阵列硬件）；可选 bypass
+        # 6) ADC：MSB 多次采样平均 + LSB DAC 增益后的独立量化；可选 bypass
+        adc_scale_msb = None
+        adc_scale_lsb = None
+        global_scale_msb = act_scale * w_scale * float(self.radix)
+        global_scale_lsb = act_scale * w_scale / lsb_gain
+        if adc_scale is not None:
+            if isinstance(adc_scale, (tuple, list)):
+                if len(adc_scale) != 2:
+                    raise ValueError(f"adc_scale tuple/list must have 2 elements (msb, lsb), got {len(adc_scale)}")
+                adc_scale_msb, adc_scale_lsb = adc_scale
+            else:
+                # 单值静态 acc scale 默认来源于“重建后输出”的 KL 校准；
+                # 这里自动折算为 raw MSB/LSB 累加器域的量化步长。
+                recon_scale = torch.as_tensor(adc_scale, device=x.device, dtype=torch.float32)
+                adc_scale_msb = recon_scale / torch.clamp(global_scale_msb, min=1e-8)
+                adc_scale_lsb = recon_scale / torch.clamp(global_scale_lsb, min=1e-8)
+
+            if adc_scale_msb is not None and not torch.is_tensor(adc_scale_msb):
+                adc_scale_msb = torch.tensor(adc_scale_msb, device=x.device, dtype=torch.float32)
+            if adc_scale_lsb is not None and not torch.is_tensor(adc_scale_lsb):
+                adc_scale_lsb = torch.tensor(adc_scale_lsb, device=x.device, dtype=torch.float32)
+            if torch.is_tensor(adc_scale_msb):
+                adc_scale_msb = adc_scale_msb.to(device=x.device, dtype=torch.float32)
+            if torch.is_tensor(adc_scale_lsb):
+                adc_scale_lsb = adc_scale_lsb.to(device=x.device, dtype=torch.float32)
+
         if BIT_SERIAL_ADC_BYPASS:
             y_msb_adc = y_msb_raw
             y_lsb_adc = y_lsb_raw
         else:
             with torch.no_grad():
-                s_adc_msb = y_msb_raw.abs().max() / float(self.qmax_adc) + 1e-8
-                s_adc_lsb = y_lsb_raw.abs().max() / float(self.qmax_adc) + 1e-8
+                if adc_scale_msb is not None:
+                    s_adc_msb = torch.clamp(adc_scale_msb, min=1e-8)
+                else:
+                    s_adc_msb = y_msb_raw.abs().max() / float(self.qmax_adc) + 1e-8
+                if adc_scale_lsb is not None:
+                    s_adc_lsb = torch.clamp(adc_scale_lsb, min=1e-8)
+                else:
+                    s_adc_lsb = y_lsb_raw.abs().max() / float(self.qmax_adc) + 1e-8
             y_msb_adc = torch.clamp(torch.round(y_msb_raw / s_adc_msb), self.qmin_adc, self.qmax_adc)
             y_lsb_adc = torch.clamp(torch.round(y_lsb_raw / s_adc_lsb), self.qmin_adc, self.qmax_adc)
             y_msb_adc = y_msb_adc * s_adc_msb
             y_lsb_adc = y_lsb_adc * s_adc_lsb
 
-        # 7) Reconstruct: (D_MSB << 8 + D_LSB) >> 8, then apply real scale
-        global_scale = act_scale * w_scale * 256.0
-        y = y_msb_adc.to(torch.float32) * global_scale + y_lsb_adc.to(torch.float32) * (global_scale / 256.0)
+        # 7) Reconstruct per INT12 radix/gain then apply real scale
+        y_recon = y_msb_adc.to(torch.float32) * float(self.radix) + y_lsb_adc.to(torch.float32) / lsb_gain
+        y = y_recon * (act_scale * w_scale)
 
         if self.bias is not None:
             y = y + self.bias.float()
@@ -317,66 +331,54 @@ class SwiGLUFFN(nn.Module):
         hidden_dim: int,
         drop=0.0,
         bias=True,
-        fake_quant: bool = False,
+        bitserial: bool = True,
         static_scales: dict | None = None,
         static_qweights: dict | None = None,
         weight_clip_pct: float = 0.0,
-        weight_nbit: int = 8
+        weight_nbit: int = 8,
+        act_nbit_eff: int = 12,
+        msb_samples: int = 2,
+        lsb_gain_shift: int = 2,
+        adc_nbit: int = 10,
     ) -> None:
         super().__init__()
         hidden_dim = int(hidden_dim * 2 / 3)
-        # If启用假量化，则用位切分 W8A16 线性阵列；否则常规 Linear。
-        self.use_bitserial = fake_quant
+        # 默认启用位串行，走等效 W8A12（可调激活精度）的 2-pass 位切分；如需禁用则退回常规 Linear。
+        self.use_bitserial = bitserial
         self.weight_nbit = weight_nbit
         if self.use_bitserial:
-            self.w12 = BitSerialLinearW8A16(dim, 2 * hidden_dim, bias=bias, adc_nbit=12, weight_clip_pct=weight_clip_pct, weight_nbit=weight_nbit)
-            self.w3 = BitSerialLinearW8A16(hidden_dim, dim, bias=bias, adc_nbit=12, weight_clip_pct=weight_clip_pct, weight_nbit=weight_nbit)
+            self.w12 = BitSerialLinearW8A16(dim, 2 * hidden_dim, bias=bias, adc_nbit=adc_nbit, weight_clip_pct=weight_clip_pct, weight_nbit=weight_nbit,
+                                            act_nbit_eff=act_nbit_eff, msb_samples=msb_samples, lsb_gain_shift=lsb_gain_shift)
+            self.w3 = BitSerialLinearW8A16(hidden_dim, dim, bias=bias, adc_nbit=adc_nbit, weight_clip_pct=weight_clip_pct, weight_nbit=weight_nbit,
+                                           act_nbit_eff=act_nbit_eff, msb_samples=msb_samples, lsb_gain_shift=lsb_gain_shift)
         else:
             self.w12 = nn.Linear(dim, 2 * hidden_dim, bias=bias)
             self.w3 = nn.Linear(hidden_dim, dim, bias=bias)
         self.ffn_dropout = nn.Dropout(drop)
-        self.fake_quant = fake_quant
         self.static_scales = static_scales or {}
-        # Force dynamic weight quant; ignore provided static_qweights
-        self.static_qweights = {}
+        self.static_qweights = static_qweights or {}
         self.weight_clip_pct = weight_clip_pct
 
     def forward(self, x):
         if self.use_bitserial:
             act_scale_w12 = self.static_scales.get('w12_act')
             if act_scale_w12 is not None:
-                act_scale_w12 = act_scale_w12.to(device=x.device, dtype=x.dtype) if torch.is_tensor(act_scale_w12) else torch.tensor(act_scale_w12, device=x.device, dtype=x.dtype)
+                act_scale_w12 = act_scale_w12.to(device=x.device, dtype=torch.float32) if torch.is_tensor(act_scale_w12) else torch.tensor(act_scale_w12, device=x.device, dtype=torch.float32)
+            acc_scale_w12 = self.static_scales.get('w12_acc')
+            if acc_scale_w12 is not None:
+                acc_scale_w12 = acc_scale_w12.to(device=x.device, dtype=torch.float32) if torch.is_tensor(acc_scale_w12) else torch.tensor(acc_scale_w12, device=x.device, dtype=torch.float32)
 
-            # Pass None to force dynamic weight scale from FP32 weights
-            x12 = self.w12(x, act_scale=act_scale_w12, w_int=None, w_scale=None)
-        elif self.fake_quant:
-            if 'w12_act' in self.static_scales:
-                act_scale = self.static_scales['w12_act']
-                act_scale = act_scale.to(device=x.device, dtype=x.dtype) if torch.is_tensor(act_scale) else torch.tensor(act_scale, device=x.device, dtype=x.dtype)
-                self.static_scales['w12_act'] = act_scale
-                x_in = _static_quant(x, act_scale, nbits=8, signed=True)
-            else:
-                x_in = _fake_quant(x, nbits=8, signed=True)
-
+            w12_int = None
+            w12_scale = None
             if 'w12.weight' in self.static_qweights:
                 w12_q = self.static_qweights['w12.weight']
-                w12_q = w12_q.to(device=x.device, dtype=x.dtype)
+                w12_q = w12_q.to(device=x.device, dtype=torch.float32)
                 self.static_qweights['w12.weight'] = w12_q
-            else:
-                w12_q = _fake_quant(self.w12.weight, nbits=self.weight_nbit, signed=True)
-            b12 = self.w12.bias
-            x12 = torch.matmul(x_in, w12_q.t())
-            if b12 is not None:
-                x12 = x12 + b12
+                max_abs_w = torch.max(w12_q.abs())
+                w12_scale = torch.clamp(max_abs_w / float(self.w12.qmax_w), min=1e-8)
+                w12_int = torch.clamp(torch.round(w12_q / w12_scale), self.w12.qmin_w, self.w12.qmax_w)
 
-            if 'w12_acc' in self.static_scales:
-                acc_scale = self.static_scales['w12_acc']
-                acc_scale = acc_scale.to(device=x12.device, dtype=x12.dtype) if torch.is_tensor(acc_scale) else torch.tensor(acc_scale, device=x12.device, dtype=x12.dtype)
-                self.static_scales['w12_acc'] = acc_scale
-                qmax_adc, qmin_adc = 511, -512
-                x12 = torch.clamp(torch.round(x12 / acc_scale), qmin_adc, qmax_adc) * acc_scale
-            else:
-                x12 = _fake_adc_10bit(x12)
+            x12 = self.w12(x, act_scale=act_scale_w12, w_int=w12_int, w_scale=w12_scale, adc_scale=acc_scale_w12)
         else:
             x12 = self.w12(x)
 
@@ -386,37 +388,22 @@ class SwiGLUFFN(nn.Module):
         if self.use_bitserial:
             act_scale_w3 = self.static_scales.get('w3_act')
             if act_scale_w3 is not None:
-                act_scale_w3 = act_scale_w3.to(device=hidden.device, dtype=hidden.dtype) if torch.is_tensor(act_scale_w3) else torch.tensor(act_scale_w3, device=hidden.device, dtype=hidden.dtype)
+                act_scale_w3 = act_scale_w3.to(device=hidden.device, dtype=torch.float32) if torch.is_tensor(act_scale_w3) else torch.tensor(act_scale_w3, device=hidden.device, dtype=torch.float32)
+            acc_scale_w3 = self.static_scales.get('w3_acc')
+            if acc_scale_w3 is not None:
+                acc_scale_w3 = acc_scale_w3.to(device=hidden.device, dtype=torch.float32) if torch.is_tensor(acc_scale_w3) else torch.tensor(acc_scale_w3, device=hidden.device, dtype=torch.float32)
 
-            out = self.w3(hidden, act_scale=act_scale_w3, w_int=None, w_scale=None)
-        elif self.fake_quant:
-            if 'w3_act' in self.static_scales:
-                act_scale = self.static_scales['w3_act']
-                act_scale = act_scale.to(device=hidden.device, dtype=hidden.dtype) if torch.is_tensor(act_scale) else torch.tensor(act_scale, device=hidden.device, dtype=hidden.dtype)
-                self.static_scales['w3_act'] = act_scale
-                hidden_q = _static_quant(hidden, act_scale, nbits=8, signed=True)
-            else:
-                hidden_q = _fake_quant(hidden, nbits=8, signed=True)
-
+            w3_int = None
+            w3_scale = None
             if 'w3.weight' in self.static_qweights:
                 w3_q = self.static_qweights['w3.weight']
-                w3_q = w3_q.to(device=hidden.device, dtype=hidden.dtype)
+                w3_q = w3_q.to(device=hidden.device, dtype=torch.float32)
                 self.static_qweights['w3.weight'] = w3_q
-            else:
-                w3_q = _fake_quant(self.w3.weight, nbits=self.weight_nbit, signed=True)
-            b3 = self.w3.bias
-            out = torch.matmul(hidden_q, w3_q.t())
-            if b3 is not None:
-                out = out + b3
+                max_abs_w = torch.max(w3_q.abs())
+                w3_scale = torch.clamp(max_abs_w / float(self.w3.qmax_w), min=1e-8)
+                w3_int = torch.clamp(torch.round(w3_q / w3_scale), self.w3.qmin_w, self.w3.qmax_w)
 
-            if 'w3_acc' in self.static_scales:
-                acc_scale = self.static_scales['w3_acc']
-                acc_scale = acc_scale.to(device=out.device, dtype=out.dtype) if torch.is_tensor(acc_scale) else torch.tensor(acc_scale, device=out.device, dtype=out.dtype)
-                self.static_scales['w3_acc'] = acc_scale
-                qmax_adc, qmin_adc = 511, -512
-                out = torch.clamp(torch.round(out / acc_scale), qmin_adc, qmax_adc) * acc_scale
-            else:
-                out = _fake_adc_10bit(out)
+            out = self.w3(hidden, act_scale=act_scale_w3, w_int=w3_int, w_scale=w3_scale, adc_scale=acc_scale_w3)
         else:
             out = self.w3(hidden)
 
@@ -445,18 +432,19 @@ class FinalLayer(nn.Module):
 
 
 class JiTBlock(nn.Module):
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, attn_drop=0.0, proj_drop=0.0, fake_quant_ffn: bool = False,
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, attn_drop=0.0, proj_drop=0.0, bitserial_ffn: bool = True,
                  ffn_static_scales: dict | None = None, ffn_static_qweights: dict | None = None, ffn_weight_clip_pct: float = 0.0,
-                 ffn_weight_nbit: int = 8):
+                 ffn_weight_nbit: int = 8, ffn_act_nbit_eff: int = 12, ffn_msb_samples: int = 2, ffn_lsb_gain_shift: int = 2, ffn_adc_nbit: int = 10):
         super().__init__()
         self.norm1 = RMSNorm(hidden_size, eps=1e-6)
         self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, qk_norm=True,
                               attn_drop=attn_drop, proj_drop=proj_drop)
         self.norm2 = RMSNorm(hidden_size, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
-        self.mlp = SwiGLUFFN(hidden_size, mlp_hidden_dim, drop=proj_drop, fake_quant=fake_quant_ffn,
+        self.mlp = SwiGLUFFN(hidden_size, mlp_hidden_dim, drop=proj_drop, bitserial=bitserial_ffn,
                              static_scales=ffn_static_scales, static_qweights=ffn_static_qweights,
-                             weight_clip_pct=ffn_weight_clip_pct, weight_nbit=ffn_weight_nbit)
+                             weight_clip_pct=ffn_weight_clip_pct, weight_nbit=ffn_weight_nbit,
+                             act_nbit_eff=ffn_act_nbit_eff, msb_samples=ffn_msb_samples, lsb_gain_shift=ffn_lsb_gain_shift, adc_nbit=ffn_adc_nbit)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
@@ -489,11 +477,15 @@ class JiT(nn.Module):
         bottleneck_dim=128,
         in_context_len=32,
         in_context_start=8,
-        ffn_fake_quant: bool = False,
+        ffn_bitserial: bool = True,
         ffn_scales_path: str = '',
         ffn_int7_weights_path: str = '',
         ffn_weight_clip_pct: float = 0.0,
-        ffn_weight_nbit: int = 8
+        ffn_weight_nbit: int = 8,
+        ffn_act_nbit_eff: int = 12,
+        ffn_msb_samples: int = 2,
+        ffn_lsb_gain_shift: int = 2,
+        ffn_adc_nbit: int = 10,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -506,6 +498,10 @@ class JiT(nn.Module):
         self.in_context_start = in_context_start
         self.num_classes = num_classes
         self.ffn_weight_clip_pct = ffn_weight_clip_pct
+        self.ffn_act_nbit_eff = ffn_act_nbit_eff
+        self.ffn_msb_samples = ffn_msb_samples
+        self.ffn_lsb_gain_shift = ffn_lsb_gain_shift
+        self.ffn_adc_nbit = ffn_adc_nbit
 
         # time and class embed
         self.t_embedder = TimestepEmbedder(hidden_size)
@@ -549,11 +545,15 @@ class JiT(nn.Module):
             block = JiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio,
                              attn_drop=attn_drop if (depth // 4 * 3 > i >= depth // 4) else 0.0,
                              proj_drop=proj_drop if (depth // 4 * 3 > i >= depth // 4) else 0.0,
-                             fake_quant_ffn=ffn_fake_quant,
+                             bitserial_ffn=ffn_bitserial,
                              ffn_static_scales=scales_i if scales_i else None,
                              ffn_static_qweights=qweights_i if qweights_i else None,
                              ffn_weight_clip_pct=ffn_weight_clip_pct,
-                             ffn_weight_nbit=ffn_weight_nbit)
+                             ffn_weight_nbit=ffn_weight_nbit,
+                             ffn_act_nbit_eff=ffn_act_nbit_eff,
+                             ffn_msb_samples=ffn_msb_samples,
+                             ffn_lsb_gain_shift=ffn_lsb_gain_shift,
+                             ffn_adc_nbit=ffn_adc_nbit)
             self.blocks.append(block)
 
         # linear predict

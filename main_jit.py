@@ -106,8 +106,9 @@ def get_args_parser():
         choices=[0, 1, 2],
         help='Which EMA to use during evaluation: 0 = no EMA, 1 = ema_decay1 (default), 2 = ema_decay2.'
     )
-    parser.add_argument('--ffn_fake_quant', action='store_true',
-                        help='Enable FFN fake quantization (INT8 activations, INT7 weights, 10-bit ADC clamp) during inference')
+    parser.add_argument('--ffn_bitserial', dest='ffn_bitserial', action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help='Enable FFN bit-serial CIM simulation (INT8 weights, configurable effective activation and ADC bits) during inference; disable with --no-ffn-bitserial')
     parser.add_argument('--ffn_use_kl_scales', default='', type=str,
                         help='Path to FFN KL calibration scales (json/npz) for static quant; optional')
     parser.add_argument('--ffn_int7_weights', default='', type=str,
@@ -116,6 +117,14 @@ def get_args_parser():
                         help='Optional percentile clipping (e.g., 99.9) on FFN weights before quantization in bit-serial mode')
     parser.add_argument('--ffn_weight_nbit', default=8, type=int,
                         help='Bitwidth for FFN bit-serial weight quantization (e.g., 8 for INT8, 7 for INT7)')
+    parser.add_argument('--ffn_act_nbit', default=12, type=int,
+                        help='Effective activation bitwidth (fixed INT12 split into 7-bit MSB + 5-bit LSB) for bit-serial CIM simulation')
+    parser.add_argument('--ffn_msb_samples', default=2, type=int,
+                        help='Number of repeated MSB samples to average for noise reduction (default 2, up to 4)')
+    parser.add_argument('--ffn_lsb_gain_shift', default=2, type=int,
+                        help='Left-shift applied to the 5-bit LSB slice before CIM (default 2 -> 4x DAC gain)')
+    parser.add_argument('--ffn_adc_nbit', default=10, type=int,
+                        help='ADC bitwidth used in bit-serial CIM simulation (default 10)')
     parser.add_argument('--keep_generated', action='store_true',
                         help='Do not delete generated samples after FID/IS (for exporting)')
     parser.add_argument('--fid_stats_path', default='', type=str,

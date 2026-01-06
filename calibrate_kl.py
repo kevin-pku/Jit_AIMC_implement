@@ -102,9 +102,12 @@ def build_denoiser_from_checkpoint(args, device):
         interval_max=1.0,
         ema_decay1=0.9999,
         ema_decay2=0.9996,
-        ffn_fake_quant=False,
+        ffn_bitserial=True,
         ffn_use_kl_scales='',
         ffn_int7_weights='',
+        ffn_msb_samples=2,
+        ffn_lsb_gain_shift=2,
+        ffn_adc_nbit=10,
     )
     for k, v in defaults.items():
         if not hasattr(ckpt_args, k):
@@ -130,9 +133,12 @@ def build_denoiser_from_checkpoint(args, device):
         cfg=ckpt_args.cfg,
         interval_min=ckpt_args.interval_min,
         interval_max=ckpt_args.interval_max,
-        ffn_fake_quant=False,
+        ffn_bitserial=True,
         ffn_use_kl_scales='',
         ffn_int7_weights='',
+        ffn_msb_samples=ckpt_args.ffn_msb_samples,
+        ffn_lsb_gain_shift=ckpt_args.ffn_lsb_gain_shift,
+        ffn_adc_nbit=ckpt_args.ffn_adc_nbit,
     )
 
     denoiser = Denoiser(ns)
