@@ -186,7 +186,12 @@ class BitSerialLinearW8A16(nn.Module):
                     s_adc_lsb = torch.clamp(adc_scale_lsb, min=1e-8)
                 else:
                     s_adc_lsb = y_lsb_raw.abs().max() / float(self.qmax_adc) + 1e-8
-            y_msb_adc = torch.clamp(torch.round(y_msb_raw / s_adc_msb), self.qmin_adc, self.qmax_adc)
+            # Inject effective thermal noise on the averaged MSB path before ADC quantization.
+            # A 2 LSB single-sample sigma is reduced by sqrt(msb_samples) due to averaging.
+            effective_sigma = 2.0 / math.sqrt(self.msb_samples)
+            y_msb_noisy = y_msb_raw + torch.randn_like(y_msb_raw) * (effective_sigma * s_adc_msb)
+
+            y_msb_adc = torch.clamp(torch.round(y_msb_noisy / s_adc_msb), self.qmin_adc, self.qmax_adc)
             y_lsb_adc = torch.clamp(torch.round(y_lsb_raw / s_adc_lsb), self.qmin_adc, self.qmax_adc)
             y_msb_adc = y_msb_adc * s_adc_msb
             y_lsb_adc = y_lsb_adc * s_adc_lsb

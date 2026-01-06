@@ -44,3 +44,4 @@
 ## 量化/硬件相关小贴士
 - 环境变量 `BIT_SERIAL_ADC_BYPASS` 可跳过 ADC 量化，`BIT_SERIAL_SINGLE_PASS` 可禁用位切分；`JIT_DISABLE_TORCH_COMPILE` 可关闭 `torch.compile` 以方便调试。【F:model_jit.py†L18-L25】【F:model_jit.py†L117-L119】【F:model_jit.py†L164-L176】
 - `main_jit.py` 暴露 `--[no-]ffn_bitserial/--ffn_use_kl_scales/--ffn_int7_weights/--ffn_weight_clip_pct/--ffn_act_nbit/--ffn_msb_samples/--ffn_lsb_gain_shift/--ffn_adc_nbit`，默认走固定 INT12（7/5 分拆）位串行路径，可在推理时灵活切换动态/静态量化、MSB 采样与 LSB 增益。【F:main_jit.py†L109-L152】
+- 位串行 MSB 通道在 ADC 量化前默认注入 2 LSB（单次采样）的高斯热噪声，并按 `msb_samples` 开根号衰减，模拟多次采样平均后的等效噪声。【F:model_jit.py†L269-L299】
