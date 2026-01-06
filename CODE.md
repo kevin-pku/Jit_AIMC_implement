@@ -45,3 +45,30 @@
 - 环境变量 `BIT_SERIAL_ADC_BYPASS` 可跳过 ADC 量化，`BIT_SERIAL_SINGLE_PASS` 可禁用位切分；`JIT_DISABLE_TORCH_COMPILE` 可关闭 `torch.compile` 以方便调试。【F:model_jit.py†L18-L25】【F:model_jit.py†L117-L119】【F:model_jit.py†L164-L176】
 - `main_jit.py` 暴露 `--[no-]ffn_bitserial/--ffn_use_kl_scales/--ffn_int7_weights/--ffn_weight_clip_pct/--ffn_act_nbit/--ffn_msb_samples/--ffn_lsb_gain_shift/--ffn_adc_nbit`，默认走固定 INT12（7/5 分拆）位串行路径，可在推理时灵活切换动态/静态量化、MSB 采样与 LSB 增益。【F:main_jit.py†L109-L152】
 - 位串行 MSB 通道在 ADC 量化前默认注入 2 LSB（单次采样）的高斯热噪声，并按 `msb_samples` 开根号衰减，模拟多次采样平均后的等效噪声。【F:model_jit.py†L269-L299】
+
+## ImageNet FID-50k 评估流程（KL 静态校准无噪声，推理加噪 2.0）
+1. **KL 静态校准（无 MSB 噪声）**：先为 FFN 线性层收集激活/累加器直方图并搜索 KL 最优 scale，注意将 `ffn_msb_noise_sigma_lsb` 设为 `0.0`，避免把噪声写入静态标定文件。
+   ```bash
+   python calibrate_kl.py \
+     --data_path /path/to/imagenet/val \
+     --output_scales /path/to/ffn_scales_imagenet.npz \
+     --ffn_bitserial \
+     --ffn_msb_noise_sigma_lsb 0.0
+   ```
+   如需同时导出量化权重，可追加对应的权重量化输出参数。
+
+2. **FID-50k/IS 推理评估（MSB 噪声 2.0）**：加载上一步生成的 KL 静态 scale（及可选 INT7/INT8 权重），在推理时开启 `ffn_msb_noise_sigma_lsb=2.0`，其余位宽/采样与硬件匹配。
+   ```bash
+   python main_jit.py \
+     --data_path /path/to/imagenet/val \
+     --fid50k \
+     --ffn_bitserial \
+     --ffn_use_kl_scales /path/to/ffn_scales_imagenet.npz \
+     --ffn_msb_noise_sigma_lsb 2.0 \
+     --ffn_adc_nbit 10 \
+     --ffn_act_nbit 12 \
+     --ffn_msb_samples 2 \
+     --ffn_lsb_gain_shift 2
+   ```
+   - 确保评估时的噪声只作用在推理前向，静态校准文件保持无噪声版本。
+   - 若同时加载静态量化权重，请带上对应的权重路径并与 scale 一起使用。
