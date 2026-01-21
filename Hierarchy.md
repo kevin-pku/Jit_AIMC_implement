@@ -9,11 +9,11 @@
 - `model_jit.py`：实现 JiT 模型、AIMC 友好的位串行线性层，以及所有 Transformer 组件（补丁嵌入、RMSNorm、RoPE 等）。【F:model_jit.py†L1-L520】
 
 ## 核心组件与量化/ADC 实现
-### BitSerialLinearW7A10（Nor-Flash 6+4 位切分）
+### BitSerialLinearW8A10（Nor-Flash 6+4 位切分）
 - 目标：用 INT7 权重、INT10 激活的 **6-bit MSB + 4-bit LSB** 2-pass 流程模拟 Nor-Flash CIM，默认 10bit（可配置 10~12bit）ADC，并支持 MSB 多次采样降噪与 LSB DAC 4× 增益。【F:model_jit.py†L32-L190】
 - 主要步骤：
-  1. **动态权重量化**：动态 99% 分位（默认值）对称截断后量化到映射到 [-64,63]；【F:model_jit.py†L120-L129】
-  2. **激活 INT10 量化与 6/4 分拆**：动态 99% 分位（默认值）对称截断后量化到 [-512,511]，再用算术右移取 6-bit 有符号 MSB、按位与提取 4-bit 无符号 LSB，并在 DAC 侧将 LSB 左移 2bit（4× 增益）。【F:model_jit.py†L131-L154】
+  1. **动态权重量化**：量化到映射到 [-128,127]；【F:model_jit.py†L120-L129】
+  2. **激活 INT10 量化与 6/4 分拆**：动态 99.5% 分位（默认值）对称截断后量化到 [-512,511]，再用算术右移取 6-bit 有符号 MSB、按位与提取 4-bit 无符号 LSB，并在 DAC 侧将 LSB 左移 2bit（4× 增益）。【F:model_jit.py†L131-L154】
   3. **模拟阵列 MVM**：MSB 通道可重复采样 K 次（默认 2、上限 4）并平均以降噪，LSB 通道使用增益后的输入；均用 FP32 计算以保持精度。【F:model_jit.py†L156-L165】
   4. **ADC 量化**：对 MSB/LSB raw 结果分别量化到 N-bit ADC（默认 10bit，支持静态 scale 或 bypass），静态单值 scale 视作重建域步长并自动折算到各通道累加器域。【F:model_jit.py†L167-L187】
   5. **数字域重构**：按公式 \(\hat{y} = 16 \cdot \overline{y_H} + y'_L/4\) 组合两通道，再乘以激活/权重全局 scale，最后加偏置。【F:model_jit.py†L189-L192】
@@ -21,7 +21,7 @@
 ### FFN 位串行与静态量化路径
 - `SwiGLUFFN` 在 `bitserial=True` 时用两层 `BitSerialLinearW7A10`（固定 INT10 6/4 分拆，支持 MSB 采样次数、LSB 增益与 ADC 位宽配置）模拟前馈；否则回退到普通 `nn.Linear`。【F:model_jit.py†L315-L402】
 - 支持两种模式：
-- **动态位串行**：默认动态权重量化、99% 分位激活截断、MSB 多次采样与 LSB 增益，配合 ADC 饱和；可通过 `BIT_SERIAL_SINGLE_PASS` 走不切片的调试路径。【F:model_jit.py†L117-L143】【F:model_jit.py†L131-L190】
+- **动态位串行**：默认动态权重量化、99.5% 分位激活截断、MSB 多次采样与 LSB 增益，配合 ADC 饱和；可通过 `BIT_SERIAL_SINGLE_PASS` 走不切片的调试路径。【F:model_jit.py†L117-L143】【F:model_jit.py†L131-L190】
 - **静态量化**：若传入 KL 校准的 `static_scales` 与预量化权重，则按固定 scale 执行位串行重建（激活 scale 以 FP32 传入，权重量化可由预量化权重反推 scale 与整数权重）。其中 `*_acc` 的单值 scale 默认视作“重建后输出”的量化步长，内部会自动折算到 MSB/LSB raw 累加域再送入 ADC。【F:model_jit.py†L320-L402】【F:model_jit.py†L146-L184】
 
 #### 动态 vs. 静态量化与 KL 校准
