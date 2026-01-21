@@ -12,8 +12,8 @@
 ### BitSerialLinearW8A10（Nor-Flash 6+4 位切分）
 - 目标：用 INT8 权重、INT12 激活的 **6-bit MSB + 4-bit LSB** 2-pass 流程模拟 Nor-Flash CIM，默认 10bit（可配置 10~12bit）ADC，并支持 MSB 多次采样降噪与 LSB DAC 4× 增益。【F:model_jit.py†L32-L190】
 - 主要步骤：
-  1. **动态权重量化**：动态 99% 分位对称截断后量化到映射到 [-128,127]；【F:model_jit.py†L120-L129】
-  2. **激活 INT10 量化与 6/4 分拆**：动态 99% 分位对称截断后量化到 [-512,511]，再用算术右移取 6-bit 有符号 MSB、按位与提取 4-bit 无符号 LSB，并在 DAC 侧将 LSB 左移 2bit（4× 增益）。【F:model_jit.py†L131-L154】
+  1. **动态权重量化**：动态 99% 分位（默认值）对称截断后量化到映射到 [-128,127]；【F:model_jit.py†L120-L129】
+  2. **激活 INT10 量化与 6/4 分拆**：动态 99% 分位（默认值）对称截断后量化到 [-512,511]，再用算术右移取 6-bit 有符号 MSB、按位与提取 4-bit 无符号 LSB，并在 DAC 侧将 LSB 左移 2bit（4× 增益）。【F:model_jit.py†L131-L154】
   3. **模拟阵列 MVM**：MSB 通道可重复采样 K 次（默认 2、上限 4）并平均以降噪，LSB 通道使用增益后的输入；均用 FP32 计算以保持精度。【F:model_jit.py†L156-L165】
   4. **ADC 量化**：对 MSB/LSB raw 结果分别量化到 N-bit ADC（默认 10bit，支持静态 scale 或 bypass），静态单值 scale 视作重建域步长并自动折算到各通道累加器域。【F:model_jit.py†L167-L187】
   5. **数字域重构**：按公式 \(\hat{y} = 16 \cdot \overline{y_H} + y'_L/4\) 组合两通道，再乘以激活/权重全局 scale，最后加偏置。【F:model_jit.py†L189-L192】
