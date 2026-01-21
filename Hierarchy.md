@@ -9,10 +9,10 @@
 - `model_jit.py`：实现 JiT 模型、AIMC 友好的位串行线性层，以及所有 Transformer 组件（补丁嵌入、RMSNorm、RoPE 等）。【F:model_jit.py†L1-L520】
 
 ## 核心组件与量化/ADC 实现
-### BitSerialLinearW8A10（Nor-Flash 6+4 位切分）
-- 目标：用 INT8 权重、INT10 激活的 **6-bit MSB + 4-bit LSB** 2-pass 流程模拟 Nor-Flash CIM，默认 10bit（可配置 10~12bit）ADC，并支持 MSB 多次采样降噪与 LSB DAC 4× 增益。【F:model_jit.py†L32-L190】
+### BitSerialLinearW7A10（Nor-Flash 6+4 位切分）
+- 目标：用 INT7 权重、INT10 激活的 **6-bit MSB + 4-bit LSB** 2-pass 流程模拟 Nor-Flash CIM，默认 10bit（可配置 10~12bit）ADC，并支持 MSB 多次采样降噪与 LSB DAC 4× 增益。【F:model_jit.py†L32-L190】
 - 主要步骤：
-  1. **动态权重量化**：动态 99% 分位（默认值）对称截断后量化到映射到 [-128,127]；【F:model_jit.py†L120-L129】
+  1. **动态权重量化**：动态 99% 分位（默认值）对称截断后量化到映射到 [-64,63]；【F:model_jit.py†L120-L129】
   2. **激活 INT10 量化与 6/4 分拆**：动态 99% 分位（默认值）对称截断后量化到 [-512,511]，再用算术右移取 6-bit 有符号 MSB、按位与提取 4-bit 无符号 LSB，并在 DAC 侧将 LSB 左移 2bit（4× 增益）。【F:model_jit.py†L131-L154】
   3. **模拟阵列 MVM**：MSB 通道可重复采样 K 次（默认 2、上限 4）并平均以降噪，LSB 通道使用增益后的输入；均用 FP32 计算以保持精度。【F:model_jit.py†L156-L165】
   4. **ADC 量化**：对 MSB/LSB raw 结果分别量化到 N-bit ADC（默认 10bit，支持静态 scale 或 bypass），静态单值 scale 视作重建域步长并自动折算到各通道累加器域。【F:model_jit.py†L167-L187】
@@ -44,7 +44,7 @@
 ## 量化/硬件相关小贴士
 - 环境变量 `BIT_SERIAL_ADC_BYPASS` 可跳过 ADC 量化，`BIT_SERIAL_SINGLE_PASS` 可禁用位切分；`JIT_DISABLE_TORCH_COMPILE` 可关闭 `torch.compile` 以方便调试。【F:model_jit.py†L18-L25】【F:model_jit.py†L117-L119】【F:model_jit.py†L164-L176】
 - `main_jit.py` 暴露 `--[no-]ffn_bitserial/--ffn_use_kl_scales/--ffn_int7_weights/--ffn_weight_clip_pct/--ffn_act_nbit/--ffn_msb_samples/--ffn_lsb_gain_shift/--ffn_adc_nbit`，默认走固定 INT10（6/4 分拆）位串行路径，可在推理时灵活切换动态/静态量化、MSB 采样与 LSB 增益。【F:main_jit.py†L109-L152】
-- 位串行 MSB 通道在 ADC 量化前默认注入 5 LSB（单次采样）的高斯热噪声，并按 `msb_samples` 开根号衰减，模拟多次采样平均后的等效噪声。【F:model_jit.py†L269-L299】
+- 位串行 MSB 通道在 ADC 量化前默认注入 5 LSB（单次采样）的高斯热噪声，并按 `msb_samples` 开根号衰减，模拟多次采样平均后的等效噪声。这里计算过程中的热噪声全部等效到ADC采样端（对于10 bit的ADC来说，动态范围相当于1024 LSB，热噪声标准差则为5LSB）【F:model_jit.py†L269-L299】
 
 ## ImageNet FID-50k 评估流程（KL 静态校准无噪声，推理加噪 2.0）
 1. **KL 静态校准（无 MSB 噪声）**：先为 FFN 线性层收集激活/累加器直方图并搜索 KL 最优 scale，注意将 `ffn_msb_noise_sigma_lsb` 设为 `0.0`，避免把噪声写入静态标定文件。
