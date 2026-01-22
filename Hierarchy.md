@@ -9,6 +9,7 @@
 - `model_jit.py`：实现 JiT 模型、AIMC 友好的位串行线性层，以及所有 Transformer 组件（补丁嵌入、RMSNorm、RoPE 等）。【F:model_jit.py†L1-L520】
 
 
+
 ## 核心组件与量化/ADC 实现
 
 ### HybridLinearW8A11（数模混合稀疏残差架构）
@@ -42,16 +43,25 @@
      * **路径 B (数字 MSB)**：仅对非零 MSB（约 8% 的离群值）执行高精度数字乘加 (INT8 MAC)。此路径完全无噪声。
 
   4. **ADC 量化**：
-     对 LSB 通道的模拟累加结果进行量化。推荐配置 **10-bit ADC**。保留 1-bit 的动态余量（9-bit 信号 vs 10-bit ADC）以抵消积分非线性 (INL) 和微分非线性 (DNL) 误差。【F:model_jit.py】
+     对 LSB 通道的模拟累加结果进行量化。推荐配置 $10$-bit ADC。保留 $1$-bit 的动态余量（9-bit 信号 vs 10-bit ADC）以抵消积分非线性 (INL) 和微分非线性 (DNL) 误差。【F:model_jit.py】
 
   5. **无噪声放大重构**：
      最终输出重构公式：
-     $$\hat{y} = (256 \cdot y_{\text{MSB_digital}}) + y_{\text{LSB_analog}}$$
+     [
+     \hat{y} = (256 \cdot y_{\text{MSB_digital}}) + y_{\text{LSB_analog}}
+     ]
      **关键改进**：放大系数 ($256$) 仅作用于无噪声的数字结果。模拟分量的增益为 1，确保系统信噪比 (SNR) 仅由 LSB 路径的本征性能决定，未引入结构性噪声放大。
 
 ### FFN 混合位串行与静态量化路径
 
 * `SwiGLUFFN` 在 `hybrid_mode=True` 时启用 `HybridLinearW8A11` 混合架构。
+* **支持两种模式**：
+
+  * **动态混合模式 (Dynamic Hybrid)**：
+    运行时实时统计激活分布。仅当激活值超出 $\pm 256$ 线性区时动态触发数字 MSB 路径。该模式能自适应不同层级的分布偏移 (Distribution Shift)，同时最小化数字能耗。
+  * **静态校准模式 (Static Calibrated)**：
+    利用 KL 散度校准预计算 `static_scales`，固定量化步长和 MSB/LSB 的稀疏模式。适用于推理部署，以减少运行时的动态分支判断开销。【F:model_jit.py】
+
 * **支持两种模式**：
 
   * **动态混合模式 (Dynamic Hybrid)**：
