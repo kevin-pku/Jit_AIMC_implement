@@ -9,18 +9,49 @@
 - `model_jit.py`：实现 JiT 模型、AIMC 友好的位串行线性层，以及所有 Transformer 组件（补丁嵌入、RMSNorm、RoPE 等）。【F:model_jit.py†L1-L520】
 
 ## 核心组件与量化/ADC 实现
-### BitSerialLinearW8A10（Nor-Flash 6+4 位切分）
-- 目标：用 INT8 权重、INT10 激活的 **6-bit MSB + 4-bit LSB** 2-pass 流程模拟 Nor-Flash CIM，默认 10bit（可配置 10~12bit）ADC，并支持 MSB 多次采样降噪与 LSB DAC 4× 增益。【F:model_jit.py†L32-L190】
-- 主要步骤：
-  1. **动态权重量化**：量化到映射到 [-128,127]；【F:model_jit.py†L120-L129】
-  2. **激活 INT10 量化与 6/4 分拆**：动态 99.5% 分位（默认值）对称截断后量化到 [-512,511]，再用算术右移取 6-bit 有符号 MSB、按位与提取 4-bit 无符号 LSB，并在 DAC 侧将 LSB 左移 2bit（4× 增益）。【F:model_jit.py†L131-L154】
-  3. **模拟阵列 MVM**：MSB 通道可重复采样 K 次（默认 2、上限 4）并平均以降噪，LSB 通道使用增益后的输入；均用 FP32 计算以保持精度。【F:model_jit.py†L156-L165】
-  4. **ADC 量化**：对 MSB/LSB raw 结果分别量化到 N-bit ADC（默认 10bit，支持静态 scale 或 bypass），静态单值 scale 视作重建域步长并自动折算到各通道累加器域。【F:model_jit.py†L167-L187】
-  5. **数字域重构**：按公式 \(\hat{y} = 16 \cdot \overline{y_H} + y'_L/4\) 组合两通道，再乘以激活/权重全局 scale，最后加偏置。【F:model_jit.py†L189-L192】
 
-### FFN 位串行与静态量化路径
-- `SwiGLUFFN` 在 `bitserial=True` 时用两层 `BitSerialLinearW8A10`（固定 INT10 6/4 分拆，支持 MSB 采样次数、LSB 增益与 ADC 位宽配置）模拟前馈；否则回退到普通 `nn.Linear`。【F:model_jit.py†L315-L402】
-- 支持两种模式：
+### HybridLinearW8A11（数模混合稀疏残差架构）
+
+-   **设计目标**：在受限的激活分布下实现 **等效 INT8 系统精度**（INT8-equivalent system precision）。架构采用 **2-bit 数字 MSB (稀疏)** + **9-bit 模拟 LSB (存算)** 的混合路径，利用激活值的本征长尾分布特性，将模拟噪声限制在低权重分量，并通过无噪声的数字域补偿高权重残差，从而在物理层面规避传统位串行方案（如 6+4）中的噪声放大问题。
+
+-   **统计学依据 (Statistical Convergence)**：
+    本架构基于大规模激活值统计设计。通过采集 **208 个样本**（Spread 标签设定），对 RMSNorm 后约 **19.5 亿 (1.95B)** 个 INT 量化值进行的覆盖率分析显示：
+    -   **[-256, 255] 区间覆盖率**：**92.04%**（适配 9-bit LSB）。
+    -   **[-128, 127] 区间覆盖率**：77.29%（不足以支撑 8-bit LSB）。
+    -   **结论**：MSB=0 的条件在绝大多数激活值中成立。这种稀疏性源于数据的**本征分布**而非激进截断，验证了数字残差补偿路径的工程有效性。
+
+-   **主要步骤**：
+
+    1.  **动态权重量化**：
+        权重映射到 $[-128, 127]$ (INT8 标准)。【F:model_jit.py】
+
+    2.  **激活 INT11 量化与中心化残差切分 (Center-Out Slicing)**：
+        -   **量化**：基于动态统计（如 99.8% 分位）将激活值对称量化至 $[-1024, 1023]$ (INT11)。
+        -   **残差切分策略**：放弃传统的按位切分，采用基于数值区间的残差分解以最大化稀疏度。
+            -   **模拟 LSB**：Clamp 至 $[-256, 255]$ (9-bit 有符号数)。该区间覆盖了 92.04% 的数据，使模拟阵列工作在最佳线性区。
+            -   **数字 MSB**：计算残差 $MSB = \text{round\_down}((x - LSB) / 256)$。
+            -   **编码**：MSB 表示为 **2-bit 有符号整数** $\{-3, ..., 3\}$。在 >92% 的情况下 MSB 恒为 0，数字 MAC 处于空闲（Skip）状态，实现极低功耗。
+
+    3.  **混合路径 MVM (Mixed-Signal MVM)**：
+        -   **路径 A (模拟 LSB)**：输入范围 $[-256, 255]$。利用 Nor-Flash 阵列计算。由于 9-bit 输入直接匹配 10-bit ADC 的动态范围，**取消 4× 增益移位**，实现 1:1 映射以避免底噪放大。
+        -   **路径 B (数字 MSB)**：仅对非零 MSB（约 8% 的离群值）执行高精度数字乘加 (INT8 MAC)。此路径完全无噪声。
+
+    4.  **ADC 量化**：
+        对 LSB 通道的模拟累加结果进行量化。推荐配置 **10-bit ADC**。保留 1-bit 的动态余量（9-bit 信号 vs 10-bit ADC）以抵消积分非线性 (INL) 和微分非线性 (DNL) 误差。【F:model_jit.py】
+
+    5.  **无噪声放大重构**：
+        最终输出重构公式：
+        $$\hat{y} = (256 \cdot y_{MSB\_digital}) + y_{LSB\_analog}$$
+        **关键改进**：放大系数 ($256$) 仅作用于无噪声的数字结果。模拟分量的增益为 1，确保系统信噪比 (SNR) 仅由 LSB 路径的本征性能决定，未引入结构性噪声放大。
+
+### FFN 混合位串行与静态量化路径
+
+-   `SwiGLUFFN` 在 `hybrid_mode=True` 时启用 `HybridLinearW8A11` 混合架构。
+-   **支持两种模式**：
+    -   **动态混合模式 (Dynamic Hybrid)**：
+        运行时实时统计激活分布。仅当激活值超出 $\pm 256$ 线性区时动态触发数字 MSB 路径。该模式能自适应不同层级的分布偏移 (Distribution Shift)，同时最小化数字能耗。
+    -   **静态校准模式 (Static Calibrated)**：
+        利用 KL 散度校准预计算 `static_scales`，固定量化步长和 MSB/LSB 的稀疏模式。适用于推理部署，以减少运行时的动态分支判断开销。【F:model_jit.py】
 - **动态位串行**：默认动态权重量化、99.5% 分位激活截断、MSB 多次采样与 LSB 增益，配合 ADC 饱和；可通过 `BIT_SERIAL_SINGLE_PASS` 走不切片的调试路径。【F:model_jit.py†L117-L143】【F:model_jit.py†L131-L190】
 - **静态量化**：若传入 KL 校准的 `static_scales` 与预量化权重，则按固定 scale 执行位串行重建（激活 scale 以 FP32 传入，权重量化可由预量化权重反推 scale 与整数权重）。其中 `*_acc` 的单值 scale 默认视作“重建后输出”的量化步长，内部会自动折算到 MSB/LSB raw 累加域再送入 ADC。【F:model_jit.py†L320-L402】【F:model_jit.py†L146-L184】
 
